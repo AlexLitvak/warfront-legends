@@ -33,6 +33,14 @@ Remotes.PerkEffect = getOrCreate("RemoteEvent", "PerkEffect") :: RemoteEvent
 
 Remotes.WeaponEquipped = getOrCreate("RemoteEvent", "WeaponEquipped") :: RemoteEvent
 Remotes.TeamAssignment = getOrCreate("RemoteEvent", "TeamAssignment") :: RemoteEvent
+Remotes.ArenaGenerated = getOrCreate("RemoteEvent", "ArenaGenerated") :: RemoteEvent
+Remotes.ArenaEvent = getOrCreate("RemoteEvent", "ArenaEvent") :: RemoteEvent
+
+-- Queue system (client <-> server)
+Remotes.JoinQueue = getOrCreate("RemoteEvent", "JoinQueue") :: RemoteEvent         -- client → server: { mode = "FFA"|"2v2"|"3v3" }
+Remotes.LeaveQueue = getOrCreate("RemoteEvent", "LeaveQueue") :: RemoteEvent       -- client → server: (no data)
+Remotes.QueueUpdate = getOrCreate("RemoteEvent", "QueueUpdate") :: RemoteEvent     -- server → client: { mode, count, needed }
+Remotes.MatchResults = getOrCreate("RemoteEvent", "MatchResults") :: RemoteEvent   -- server → client: standings, coins, stats
 
 -- RemoteFunctions (client -> server request/response)
 Remotes.ShopPurchase = getOrCreate("RemoteFunction", "ShopPurchase") :: RemoteFunction

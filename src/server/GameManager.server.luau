@@ -1,13 +1,22 @@
 --!strict
 --[[
 	GameManager (Server)
-	Manages the match lifecycle: lobby → countdown → match → results.
-	Supports three game modes that rotate each match:
-	  • FFA   — free-for-all, individual kill scoring
-	  • 2v2   — two teams of two, team kill scoring
-	  • 3v3   — two teams of three, team kill scoring
-	Tracks kills/deaths, enforces timers and kill thresholds, handles
-	respawning, team assignment, and broadcasts state to all clients.
+	Master match controller that manages the full player-facing flow:
+	  Lobby → Queueing → Generating → Countdown → InProgress → Results → Lobby
+
+	Queue system:
+	  - Separate queues for FFA (8 players, min 4 after 60s), 2v2 (4), 3v3 (6)
+	  - Players join/leave queues via RemoteEvents
+	  - Queue counts broadcast to all queued players in real-time
+
+	Arena integration:
+	  - Uses ArenaManager BindableFunction/Event API for arena lifecycle
+	  - SelectArena → SetupArena → SpawnMatchPlayers → StartArenaHazards → CleanupArena
+
+	Combat tracking:
+	  - Kills/deaths per player, team scores for team modes
+	  - Win conditions: kill threshold OR timer expiry
+	  - End-of-match coin awards via CoinManager
 ]]
 
 local Players = game:GetService("Players")
@@ -18,13 +27,13 @@ local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
 local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
 
 ------------------------------------------------------------------------
--- Match-flow constants
+-- Constants
 ------------------------------------------------------------------------
 
-local MIN_PLAYERS_TO_START = 2
-local COUNTDOWN_DURATION = 10
+local COUNTDOWN_DURATION = 5
 local RESULTS_DURATION = 10
 local TIMER_TICK = 1
+local QUEUE_TIMEOUT_FFA = 60 -- seconds before FFA starts with min players
 
 ------------------------------------------------------------------------
 -- Game mode definitions
@@ -32,20 +41,17 @@ local TIMER_TICK = 1
 
 type GameMode = "FFA" | "2v2" | "3v3"
 
-local MODE_ROTATION: { GameMode } = { "FFA", "2v2", "3v3" }
-local currentModeIndex = 1
-
 local MODE_CONFIG: { [GameMode]: {
 	minPlayers: number,
 	maxPlayers: number,
 	matchDuration: number,
 	killThreshold: number,
 	respawnTime: number,
-	teamSize: number,      -- 0 = FFA
-	teamCount: number,     -- 0 = FFA
+	teamSize: number,
+	teamCount: number,
 } } = {
 	FFA = {
-		minPlayers = 2,
+		minPlayers = 4,
 		maxPlayers = GameConfig.MAX_PLAYERS_FFA,
 		matchDuration = GameConfig.MATCH_DURATION_FFA,
 		killThreshold = GameConfig.KILL_THRESHOLD_FFA,
@@ -74,7 +80,7 @@ local MODE_CONFIG: { [GameMode]: {
 }
 
 ------------------------------------------------------------------------
--- Server-side BindableEvents
+-- Server-side BindableEvents / BindableFunctions
 ------------------------------------------------------------------------
 
 local serverEvents = ServerScriptService:FindFirstChild("ServerEvents") :: Folder
@@ -85,63 +91,86 @@ if not serverEvents then
 	serverEvents = folder
 end
 
-local onPlayerKill = serverEvents:FindFirstChild("OnPlayerKill") :: BindableEvent
-if not onPlayerKill then
-	local event = Instance.new("BindableEvent")
-	event.Name = "OnPlayerKill"
-	event.Parent = serverEvents
-	onPlayerKill = event
+local function getOrCreateBindable(className: string, name: string): Instance
+	local existing = serverEvents:FindFirstChild(name)
+	if existing then
+		return existing
+	end
+	local inst = Instance.new(className)
+	inst.Name = name
+	inst.Parent = serverEvents
+	return inst
 end
 
-local addPlayerCoins = serverEvents:FindFirstChild("AddPlayerCoins") :: BindableEvent
-if not addPlayerCoins then
-	local event = Instance.new("BindableEvent")
-	event.Name = "AddPlayerCoins"
-	event.Parent = serverEvents
-	addPlayerCoins = event
-end
+-- Kill tracking (CombatHandler fires this)
+local onPlayerKill = getOrCreateBindable("BindableEvent", "OnPlayerKill") :: BindableEvent
 
--- GetPlayerTeam: CombatHandler invokes to check team for friendly fire
-local getPlayerTeamFunc = serverEvents:FindFirstChild("GetPlayerTeam") :: BindableFunction
-if not getPlayerTeamFunc then
-	local func = Instance.new("BindableFunction")
-	func.Name = "GetPlayerTeam"
-	func.Parent = serverEvents
-	getPlayerTeamFunc = func
-end
+-- Coin system
+local addPlayerCoins = getOrCreateBindable("BindableEvent", "AddPlayerCoins") :: BindableEvent
+
+-- Team query (CombatHandler invokes this to check friendly fire)
+local getPlayerTeamFunc = getOrCreateBindable("BindableFunction", "GetPlayerTeam") :: BindableFunction
+
+-- ArenaManager API
+local selectArenaFunc = getOrCreateBindable("BindableFunction", "SelectArena") :: BindableFunction
+local setupArenaFunc = getOrCreateBindable("BindableFunction", "SetupArena") :: BindableFunction
+local spawnMatchPlayersEvent = getOrCreateBindable("BindableEvent", "SpawnMatchPlayers") :: BindableEvent
+local startArenaHazardsEvent = getOrCreateBindable("BindableEvent", "StartArenaHazards") :: BindableEvent
+local cleanupArenaEvent = getOrCreateBindable("BindableEvent", "CleanupArena") :: BindableEvent
 
 ------------------------------------------------------------------------
 -- Match state
 ------------------------------------------------------------------------
 
-type MatchState = "WaitingForPlayers" | "Countdown" | "InProgress" | "Results"
+type MatchPhase = "Lobby" | "Queueing" | "Generating" | "Countdown" | "InProgress" | "Results"
 
 type PlayerMatchStats = {
 	kills: number,
 	deaths: number,
+	damageDealt: number,
+	assists: number,
 	coinsEarned: number,
 }
 
-local currentState: MatchState = "WaitingForPlayers"
+local currentPhase: MatchPhase = "Lobby"
 local currentGameMode: GameMode = "FFA"
 local matchPlayers: { Player } = {}
 local playerStats: { [Player]: PlayerMatchStats } = {}
 local matchTimeRemaining: number = 0
-local countdownRemaining: number = 0
 local matchLoopThread: thread? = nil
+local currentArenaFolder: Folder? = nil
+local currentArenaType: string = ""
 
--- Team state (only active during 2v2/3v3)
-local teamAssignments: { [Player]: number } = {} -- player → team number (1 or 2)
-local teamScores: { [number]: number } = {}      -- team number → total kills
-
-------------------------------------------------------------------------
--- Team helpers
-------------------------------------------------------------------------
+-- Team state
+local teamAssignments: { [Player]: number } = {}
+local teamScores: { [number]: number } = {}
 
 local TEAM_NAMES: { [number]: string } = {
 	[1] = "Blue",
 	[2] = "Red",
 }
+
+------------------------------------------------------------------------
+-- Queue state
+------------------------------------------------------------------------
+
+type QueueEntry = {
+	player: Player,
+	joinedAt: number,
+}
+
+local queues: { [GameMode]: { QueueEntry } } = {
+	FFA = {},
+	["2v2"] = {},
+	["3v3"] = {},
+}
+
+-- Track which queue each player is in (nil = not queued)
+local playerQueue: { [Player]: GameMode } = {}
+
+------------------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------------------
 
 local function isTeamMode(): boolean
 	return currentGameMode == "2v2" or currentGameMode == "3v3"
@@ -150,6 +179,159 @@ end
 local function getPlayerTeam(player: Player): number
 	return teamAssignments[player] or 0
 end
+
+local function setPhase(newPhase: MatchPhase)
+	currentPhase = newPhase
+	print(string.format("[GameManager] Phase → %s (mode: %s)", newPhase, currentGameMode))
+end
+
+local function broadcastMatchState(data: { [string]: any })
+	data.state = currentPhase
+	data.gameMode = currentGameMode
+
+	if isTeamMode() then
+		data.teamScores = teamScores
+		local teamMap: { [string]: number } = {}
+		for player, team in teamAssignments do
+			if player.Parent then
+				teamMap[player.Name] = team
+			end
+		end
+		data.teamMap = teamMap
+	end
+
+	Remotes.MatchStateChange:FireAllClients(data)
+end
+
+------------------------------------------------------------------------
+-- Queue management
+------------------------------------------------------------------------
+
+local function getQueuePlayerCount(mode: GameMode): number
+	return #queues[mode]
+end
+
+local function broadcastQueueUpdate(mode: GameMode)
+	local config = MODE_CONFIG[mode]
+	local count = getQueuePlayerCount(mode)
+	local needed = config.maxPlayers
+
+	for _, entry in queues[mode] do
+		if entry.player.Parent then
+			Remotes.QueueUpdate:FireClient(entry.player, {
+				mode = mode,
+				count = count,
+				needed = needed,
+			})
+		end
+	end
+end
+
+local function removeFromQueue(player: Player)
+	local mode = playerQueue[player]
+	if not mode then
+		return
+	end
+
+	local queue = queues[mode]
+	for i, entry in queue do
+		if entry.player == player then
+			table.remove(queue, i)
+			break
+		end
+	end
+
+	playerQueue[player] = nil
+	broadcastQueueUpdate(mode)
+end
+
+local function addToQueue(player: Player, mode: GameMode)
+	-- Remove from any existing queue first
+	removeFromQueue(player)
+
+	local config = MODE_CONFIG[mode]
+	if not config then
+		return
+	end
+
+	-- Don't allow joining if a match is launching for this mode
+	-- (or if the queue is already full)
+	if getQueuePlayerCount(mode) >= config.maxPlayers then
+		return
+	end
+
+	table.insert(queues[mode], {
+		player = player,
+		joinedAt = os.clock(),
+	})
+	playerQueue[player] = mode
+
+	broadcastQueueUpdate(mode)
+end
+
+--- Pull players from a queue to form a match. Returns the list of players.
+local function drainQueue(mode: GameMode, count: number): { Player }
+	local queue = queues[mode]
+	local players: { Player } = {}
+
+	local pulled = 0
+	while pulled < count and #queue > 0 do
+		local entry = table.remove(queue, 1) :: QueueEntry
+		if entry.player.Parent then
+			table.insert(players, entry.player)
+			playerQueue[entry.player] = nil
+			pulled += 1
+		end
+	end
+
+	broadcastQueueUpdate(mode)
+	return players
+end
+
+-- Forward declaration (launchMatch is defined after checkQueues)
+local launchMatch: (mode: GameMode, playerCount: number) -> ()
+
+--- Check if any queue is ready to launch a match.
+local function checkQueues()
+	-- Don't start a new match if one is already running
+	if currentPhase ~= "Lobby" then
+		return
+	end
+
+	-- Check each mode
+	for _, mode: GameMode in { "FFA", "2v2", "3v3" } :: { GameMode } do
+		local config = MODE_CONFIG[mode]
+		local count = getQueuePlayerCount(mode)
+
+		if mode == "FFA" then
+			-- FFA: starts at 8 players, OR after 60s with minimum 4
+			if count >= config.maxPlayers then
+				launchMatch(mode, config.maxPlayers)
+				return
+			end
+
+			-- Check timeout with minimum players
+			if count >= config.minPlayers then
+				local queue = queues[mode]
+				local oldestEntry = queue[1]
+				if oldestEntry and (os.clock() - oldestEntry.joinedAt) >= QUEUE_TIMEOUT_FFA then
+					launchMatch(mode, count)
+					return
+				end
+			end
+		else
+			-- Team modes: start when exact player count is met
+			if count >= config.maxPlayers then
+				launchMatch(mode, config.maxPlayers)
+				return
+			end
+		end
+	end
+end
+
+------------------------------------------------------------------------
+-- Team assignment
+------------------------------------------------------------------------
 
 local function assignTeams()
 	teamAssignments = {}
@@ -167,7 +349,7 @@ local function assignTeams()
 		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 	end
 
-	-- Assign alternating teams: first half team 1, second half team 2
+	-- First half → team 1, second half → team 2
 	local teamSize = config.teamSize
 	for i, player in shuffled do
 		if i <= teamSize then
@@ -177,7 +359,7 @@ local function assignTeams()
 		end
 	end
 
-	-- Notify each player of their team assignment
+	-- Notify each player
 	for player, team in teamAssignments do
 		if player.Parent then
 			Remotes.TeamAssignment:FireClient(player, {
@@ -189,59 +371,12 @@ local function assignTeams()
 	end
 end
 
---- Build a map of all player team assignments for broadcasting.
-local function getTeamMap(): { [string]: number }
-	local map: { [string]: number } = {}
-	for player, team in teamAssignments do
-		if player.Parent then
-			map[player.Name] = team
-		end
-	end
-	return map
-end
-
 ------------------------------------------------------------------------
--- Mode selection
+-- Standings & coin awards
 ------------------------------------------------------------------------
 
---- Pick the next viable game mode based on player count.
-local function selectNextMode(): GameMode
-	local playerCount = #Players:GetPlayers()
-
-	-- Try modes in rotation order starting from current index
-	for offset = 0, #MODE_ROTATION - 1 do
-		local idx = ((currentModeIndex - 1 + offset) % #MODE_ROTATION) + 1
-		local mode = MODE_ROTATION[idx]
-		local config = MODE_CONFIG[mode]
-		if playerCount >= config.minPlayers then
-			currentModeIndex = (idx % #MODE_ROTATION) + 1 -- advance for next time
-			return mode
-		end
-	end
-
-	-- Fallback to FFA (lowest player requirement)
-	return "FFA"
-end
-
-------------------------------------------------------------------------
--- Helpers
-------------------------------------------------------------------------
-
-local function broadcastState(data: { [string]: any })
-	data.state = currentState
-	data.gameMode = currentGameMode
-
-	-- Include team data during team matches
-	if isTeamMode() then
-		data.teamScores = teamScores
-		data.teamMap = getTeamMap()
-	end
-
-	Remotes.MatchStateChange:FireAllClients(data)
-end
-
-local function getStandings(): { { name: string, kills: number, deaths: number, team: number? } }
-	local standings: { { name: string, kills: number, deaths: number, team: number? } } = {}
+local function getStandings(): { { name: string, kills: number, deaths: number, assists: number, damageDealt: number, coinsEarned: number, team: number? } }
+	local standings = {}
 	for _, player in matchPlayers do
 		if player.Parent then
 			local stats = playerStats[player]
@@ -250,6 +385,9 @@ local function getStandings(): { { name: string, kills: number, deaths: number, 
 					name = player.Name,
 					kills = stats.kills,
 					deaths = stats.deaths,
+					assists = stats.assists,
+					damageDealt = stats.damageDealt,
+					coinsEarned = stats.coinsEarned,
 					team = if isTeamMode() then teamAssignments[player] else nil,
 				})
 			end
@@ -259,32 +397,6 @@ local function getStandings(): { { name: string, kills: number, deaths: number, 
 		return a.kills > b.kills
 	end)
 	return standings
-end
-
-local function spawnPlayer(player: Player)
-	if player.Parent then
-		player:LoadCharacter()
-	end
-end
-
-local function respawnAfterDelay(player: Player)
-	local config = MODE_CONFIG[currentGameMode]
-	local respawnTime = if config then config.respawnTime else GameConfig.RESPAWN_TIME_FFA
-
-	task.delay(respawnTime, function()
-		if currentState == "InProgress" and player.Parent then
-			spawnPlayer(player)
-		end
-	end)
-end
-
-------------------------------------------------------------------------
--- State transitions
-------------------------------------------------------------------------
-
-local function setState(newState: MatchState)
-	currentState = newState
-	print(string.format("[GameManager] State → %s (mode: %s)", newState, currentGameMode))
 end
 
 local function awardEndOfMatchCoins(winnerPlayer: Player?, winningTeam: number?)
@@ -301,9 +413,8 @@ local function awardEndOfMatchCoins(winnerPlayer: Player?, winningTeam: number?)
 		addPlayerCoins:Fire(player, GameConfig.COINS_MATCH_COMPLETE, "MatchComplete")
 		stats.coinsEarned += GameConfig.COINS_MATCH_COMPLETE
 
-		-- Winner gets bonus
+		-- Winner bonus
 		if isTeamMode() then
-			-- Entire winning team gets the bonus
 			if winningTeam and teamAssignments[player] == winningTeam then
 				addPlayerCoins:Fire(player, GameConfig.COINS_WIN_BONUS, "MatchWin")
 				stats.coinsEarned += GameConfig.COINS_WIN_BONUS
@@ -318,19 +429,208 @@ local function awardEndOfMatchCoins(winnerPlayer: Player?, winningTeam: number?)
 end
 
 ------------------------------------------------------------------------
+-- Respawning
+------------------------------------------------------------------------
+
+local function respawnInArena(player: Player)
+	if not player.Parent or currentPhase ~= "InProgress" then
+		return
+	end
+
+	-- Re-spawn character, then ArenaManager will handle positioning
+	-- if there's an active arena folder
+	if currentArenaFolder then
+		spawnMatchPlayersEvent:Fire({ player }, currentArenaFolder)
+	else
+		player:LoadCharacter()
+	end
+end
+
+local function respawnAfterDelay(player: Player)
+	local config = MODE_CONFIG[currentGameMode]
+	local respawnTime = if config then config.respawnTime else GameConfig.RESPAWN_TIME_FFA
+
+	task.delay(respawnTime, function()
+		if currentPhase == "InProgress" and player.Parent then
+			respawnInArena(player)
+		end
+	end)
+end
+
+------------------------------------------------------------------------
 -- Match phases
 ------------------------------------------------------------------------
 
-local function runResults()
-	setState("Results")
+-- Forward declarations
+local runResults: () -> ()
+local runMatch: () -> ()
+local runCountdown: () -> ()
+
+launchMatch = function(mode: GameMode, playerCount: number)
+	if currentPhase ~= "Lobby" then
+		return
+	end
+
+	currentGameMode = mode
+
+	-- Pull players from queue
+	matchPlayers = drainQueue(mode, playerCount)
+	if #matchPlayers < MODE_CONFIG[mode].minPlayers then
+		-- Not enough valid players after draining (some may have disconnected)
+		-- Return them to lobby
+		matchPlayers = {}
+		setPhase("Lobby")
+		return
+	end
+
+	-- Initialize stats
+	playerStats = {}
+	for _, player in matchPlayers do
+		playerStats[player] = {
+			kills = 0,
+			deaths = 0,
+			damageDealt = 0,
+			assists = 0,
+			coinsEarned = 0,
+		}
+	end
+
+	-- Assign teams for team modes
+	if isTeamMode() then
+		assignTeams()
+	end
+
+	-- Generate arena
+	setPhase("Generating")
+	broadcastMatchState({})
+
+	local arenaType = selectArenaFunc:Invoke("random")
+	currentArenaType = arenaType
+	local arenaFolder = setupArenaFunc:Invoke(arenaType)
+	currentArenaFolder = arenaFolder
+
+	if not arenaFolder then
+		warn("[GameManager] Arena generation failed, aborting match")
+		matchPlayers = {}
+		playerStats = {}
+		teamAssignments = {}
+		teamScores = {}
+		currentArenaFolder = nil
+		currentArenaType = ""
+		setPhase("Lobby")
+		return
+	end
+
+	-- Spawn all match players in the arena
+	spawnMatchPlayersEvent:Fire(matchPlayers, arenaFolder)
+
+	-- Run countdown
+	runCountdown()
+end
+
+runCountdown = function()
+	setPhase("Countdown")
+
+	local remaining = COUNTDOWN_DURATION
+	while remaining > 0 do
+		broadcastMatchState({
+			countdown = remaining,
+			arenaName = currentArenaType,
+		})
+
+		task.wait(1)
+		remaining -= 1
+
+		-- Abort if too many players left
+		local alive = 0
+		for _, player in matchPlayers do
+			if player.Parent then
+				alive += 1
+			end
+		end
+		if alive < 2 then
+			print("[GameManager] Not enough players during countdown, aborting")
+			cleanupArenaEvent:Fire()
+			matchPlayers = {}
+			playerStats = {}
+			teamAssignments = {}
+			teamScores = {}
+			currentArenaFolder = nil
+			currentArenaType = ""
+			setPhase("Lobby")
+			broadcastMatchState({})
+			return
+		end
+	end
+
+	-- FIGHT!
+	broadcastMatchState({
+		countdown = 0,
+		arenaName = currentArenaType,
+	})
+	task.wait(0.5)
+
+	runMatch()
+end
+
+runMatch = function()
+	setPhase("InProgress")
+
+	local config = MODE_CONFIG[currentGameMode]
+	matchTimeRemaining = if config then config.matchDuration else GameConfig.MATCH_DURATION_FFA
+
+	-- Start arena hazards (ArenaManager handles 5s grace period internally)
+	startArenaHazardsEvent:Fire(currentArenaType)
+
+	broadcastMatchState({
+		timeRemaining = matchTimeRemaining,
+		standings = getStandings(),
+	})
+
+	-- Death → respawn loop for each match player
+	for _, player in matchPlayers do
+		task.spawn(function()
+			while currentPhase == "InProgress" and player.Parent do
+				local character = player.Character or player.CharacterAdded:Wait()
+				local humanoid = character:WaitForChild("Humanoid") :: Humanoid
+				humanoid.Died:Wait()
+				respawnAfterDelay(player)
+
+				if currentPhase == "InProgress" and player.Parent then
+					player.CharacterAdded:Wait()
+				end
+			end
+		end)
+	end
+
+	-- Match timer loop
+	matchLoopThread = task.spawn(function()
+		while matchTimeRemaining > 0 and currentPhase == "InProgress" do
+			task.wait(TIMER_TICK)
+			matchTimeRemaining -= TIMER_TICK
+
+			broadcastMatchState({
+				timeRemaining = matchTimeRemaining,
+				standings = getStandings(),
+			})
+		end
+
+		if currentPhase == "InProgress" then
+			runResults()
+		end
+	end)
+end
+
+runResults = function()
+	setPhase("Results")
 
 	local standings = getStandings()
 	local resultData: { [string]: any } = {
 		standings = standings,
+		arenaName = currentArenaType,
 	}
 
 	if isTeamMode() then
-		-- Determine winning team
 		local score1 = teamScores[1] or 0
 		local score2 = teamScores[2] or 0
 		local winningTeam: number? = nil
@@ -339,7 +639,6 @@ local function runResults()
 		elseif score2 > score1 then
 			winningTeam = 2
 		end
-		-- nil means draw
 
 		resultData.winningTeam = winningTeam
 		resultData.winner = if winningTeam then ("Team " .. TEAM_NAMES[winningTeam]) else "Draw"
@@ -350,7 +649,6 @@ local function runResults()
 		local winnerName = if #standings > 0 then standings[1].name else "Nobody"
 		resultData.winner = winnerName
 
-		-- Find winner Player object for coin reward
 		local winner: Player? = nil
 		for _, player in matchPlayers do
 			if player.Parent and player.Name == winnerName then
@@ -362,43 +660,72 @@ local function runResults()
 		awardEndOfMatchCoins(winner, nil)
 	end
 
-	broadcastState(resultData)
+	-- Send detailed results to each match player
+	for _, player in matchPlayers do
+		if player.Parent then
+			local stats = playerStats[player]
+			local personalData = table.clone(resultData)
+			if stats then
+				personalData.personalStats = {
+					kills = stats.kills,
+					deaths = stats.deaths,
+					assists = stats.assists,
+					damageDealt = stats.damageDealt,
+					coinsEarned = stats.coinsEarned,
+				}
+			end
+			personalData.lastMode = currentGameMode
+			Remotes.MatchResults:FireClient(player, personalData)
+		end
+	end
 
+	-- Also broadcast general state change
+	broadcastMatchState(resultData)
+
+	-- Wait for results screen
 	task.wait(RESULTS_DURATION)
 
-	-- Clean up match data
+	-- Cleanup
+	cleanupArenaEvent:Fire()
+
+	-- Respawn all match players for lobby
+	for _, player in matchPlayers do
+		if player.Parent then
+			player:LoadCharacter()
+		end
+	end
+
 	matchPlayers = {}
 	playerStats = {}
 	teamAssignments = {}
 	teamScores = {}
+	currentArenaFolder = nil
+	currentArenaType = ""
+	matchLoopThread = nil
 
-	-- Respawn everyone for lobby
-	for _, player in Players:GetPlayers() do
-		spawnPlayer(player)
-	end
-
-	setState("WaitingForPlayers")
-	checkPlayerCount()
+	setPhase("Lobby")
+	broadcastMatchState({})
 end
 
+------------------------------------------------------------------------
+-- Kill handling (from CombatHandler)
+------------------------------------------------------------------------
+
 local function onKillDuringMatch(killer: Player, victim: Player)
-	if currentState ~= "InProgress" then
+	if currentPhase ~= "InProgress" then
 		return
 	end
 
-	-- Update killer stats
 	local killerStats = playerStats[killer]
 	if killerStats then
 		killerStats.kills += 1
 	end
 
-	-- Update victim stats
 	local victimStats = playerStats[victim]
 	if victimStats then
 		victimStats.deaths += 1
 	end
 
-	-- Update team scores
 	if isTeamMode() then
 		local killerTeam = teamAssignments[killer]
 		if killerTeam then
@@ -407,17 +734,16 @@ local function onKillDuringMatch(killer: Player, victim: Player)
 	end
 
 	-- Broadcast updated scores
-	broadcastState({
+	broadcastMatchState({
 		timeRemaining = matchTimeRemaining,
 		standings = getStandings(),
 	})
 
-	-- Check kill threshold for early win
+	-- Check kill threshold win
 	local config = MODE_CONFIG[currentGameMode]
 	local threshold = if config then config.killThreshold else GameConfig.KILL_THRESHOLD_FFA
 
 	if isTeamMode() then
-		-- Check if any team reached the threshold
 		for _, score in teamScores do
 			if score >= threshold then
 				if matchLoopThread then
@@ -443,127 +769,41 @@ local function onKillDuringMatch(killer: Player, victim: Player)
 	respawnAfterDelay(victim)
 end
 
-local function runMatch()
-	setState("InProgress")
-
-	local config = MODE_CONFIG[currentGameMode]
-	matchTimeRemaining = if config then config.matchDuration else GameConfig.MATCH_DURATION_FFA
-
-	-- Snapshot current players into the match
-	matchPlayers = {}
-	playerStats = {}
-	for _, player in Players:GetPlayers() do
-		table.insert(matchPlayers, player)
-		playerStats[player] = {
-			kills = 0,
-			deaths = 0,
-			coinsEarned = 0,
-		}
-	end
-
-	-- Assign teams for team modes
-	if isTeamMode() then
-		assignTeams()
-	end
-
-	-- Spawn all players fresh
-	for _, player in matchPlayers do
-		spawnPlayer(player)
-	end
-
-	broadcastState({
-		timeRemaining = matchTimeRemaining,
-		standings = getStandings(),
-	})
-
-	-- Hook up death events for respawning
-	for _, player in matchPlayers do
-		task.spawn(function()
-			while currentState == "InProgress" and player.Parent do
-				local character = player.Character or player.CharacterAdded:Wait()
-				local humanoid = character:WaitForChild("Humanoid") :: Humanoid
-				humanoid.Died:Wait()
-				respawnAfterDelay(player)
-
-				if currentState == "InProgress" and player.Parent then
-					player.CharacterAdded:Wait()
-				end
-			end
-		end)
-	end
-
-	-- Match timer loop
-	matchLoopThread = task.spawn(function()
-		while matchTimeRemaining > 0 and currentState == "InProgress" do
-			task.wait(TIMER_TICK)
-			matchTimeRemaining -= TIMER_TICK
-
-			broadcastState({
-				timeRemaining = matchTimeRemaining,
-				standings = getStandings(),
-			})
-		end
-
-		if currentState == "InProgress" then
-			runResults()
-		end
-	end)
-end
-
-local function runCountdown()
-	setState("Countdown")
-	countdownRemaining = COUNTDOWN_DURATION
-
-	while countdownRemaining > 0 do
-		broadcastState({
-			countdown = countdownRemaining,
-		})
-
-		task.wait(1)
-		countdownRemaining -= 1
-
-		-- If players leave during countdown and we drop below minimum, abort
-		local minNeeded = MODE_CONFIG[currentGameMode].minPlayers
-		if #Players:GetPlayers() < minNeeded then
-			print("[GameManager] Not enough players, countdown aborted")
-			setState("WaitingForPlayers")
-			broadcastState({})
-			return
-		end
-	end
-
-	runMatch()
-end
-
-function checkPlayerCount()
-	if currentState ~= "WaitingForPlayers" then
-		return
-	end
-
-	-- Select the next viable game mode
-	currentGameMode = selectNextMode()
-	local config = MODE_CONFIG[currentGameMode]
-
-	local playerCount = #Players:GetPlayers()
-	local playersNeeded = config.minPlayers - playerCount
-
-	broadcastState({
-		playersNeeded = playersNeeded,
-		currentPlayers = playerCount,
-	})
-
-	if playerCount >= config.minPlayers then
-		task.spawn(runCountdown)
-	end
-end
-
 ------------------------------------------------------------------------
--- GetPlayerTeam BindableFunction (CombatHandler queries this)
+-- GetPlayerTeam (CombatHandler queries this for friendly fire)
 ------------------------------------------------------------------------
 
 getPlayerTeamFunc.OnInvoke = function(player: Player): number
 	return getPlayerTeam(player)
 end
+
+------------------------------------------------------------------------
+-- Queue RemoteEvent handlers
+------------------------------------------------------------------------
+
+Remotes.JoinQueue.OnServerEvent:Connect(function(player: Player, data: { [string]: any })
+	local mode = data.mode :: string?
+	if not mode then
+		return
+	end
+
+	-- Validate mode
+	if mode ~= "FFA" and mode ~= "2v2" and mode ~= "3v3" then
+		return
+	end
+
+	-- Can't queue if already in a match
+	if table.find(matchPlayers, player) then
+		return
+	end
+
+	addToQueue(player, mode :: GameMode)
+	checkQueues()
+end)
+
+Remotes.LeaveQueue.OnServerEvent:Connect(function(player: Player)
+	removeFromQueue(player)
+end)
 
 ------------------------------------------------------------------------
 -- Player lifecycle
@@ -572,41 +812,31 @@ end
 Players.CharacterAutoLoads = false
 
 local function onPlayerAdded(player: Player)
-	-- Spawn them immediately if we're in lobby/countdown
-	if currentState == "WaitingForPlayers" or currentState == "Countdown" then
-		spawnPlayer(player)
-	end
+	-- Spawn in lobby
+	player:LoadCharacter()
 
-	-- Notify the new player of current match state
-	local stateData: { [string]: any } = {
-		state = currentState,
-		gameMode = currentGameMode,
-		timeRemaining = if currentState == "InProgress" then matchTimeRemaining else nil,
-		countdown = if currentState == "Countdown" then countdownRemaining else nil,
-		standings = if currentState == "InProgress" then getStandings() else nil,
-	}
-
-	if isTeamMode() then
-		stateData.teamScores = teamScores
-		stateData.teamMap = getTeamMap()
-	end
-
-	Remotes.MatchStateChange:FireClient(player, stateData)
-
-	-- If they're in a team match, tell them their team
-	if isTeamMode() and teamAssignments[player] then
-		Remotes.TeamAssignment:FireClient(player, {
-			team = teamAssignments[player],
-			teamName = TEAM_NAMES[teamAssignments[player]],
-			gameMode = currentGameMode,
+	-- Notify of current state
+	if currentPhase == "Lobby" then
+		Remotes.MatchStateChange:FireClient(player, {
+			state = "Lobby",
 		})
+	else
+		-- Match in progress — let them know
+		local stateData: { [string]: any } = {
+			state = currentPhase,
+			gameMode = currentGameMode,
+			timeRemaining = if currentPhase == "InProgress" then matchTimeRemaining else nil,
+			standings = if currentPhase == "InProgress" then getStandings() else nil,
+		}
+		Remotes.MatchStateChange:FireClient(player, stateData)
 	end
-
-	checkPlayerCount()
 end
 
 local function onPlayerRemoving(player: Player)
-	-- Remove from match tracking
+	-- Remove from queue
+	removeFromQueue(player)
+
+	-- Remove from active match
 	local idx = table.find(matchPlayers, player)
 	if idx then
 		table.remove(matchPlayers, idx)
@@ -614,15 +844,15 @@ local function onPlayerRemoving(player: Player)
 	playerStats[player] = nil
 	teamAssignments[player] = nil
 
-	-- If mid-match and not enough players remain, end early
-	if currentState == "InProgress" then
-		local alivePlayers = 0
+	-- End match early if not enough players
+	if currentPhase == "InProgress" then
+		local alive = 0
 		for _, p in matchPlayers do
 			if p.Parent then
-				alivePlayers += 1
+				alive += 1
 			end
 		end
-		if alivePlayers < 2 then
+		if alive < 2 then
 			if matchLoopThread then
 				task.cancel(matchLoopThread)
 				matchLoopThread = nil
@@ -633,10 +863,22 @@ local function onPlayerRemoving(player: Player)
 end
 
 ------------------------------------------------------------------------
+-- Queue check loop (handles FFA timeout)
+------------------------------------------------------------------------
+
+task.spawn(function()
+	while true do
+		task.wait(1)
+		if currentPhase == "Lobby" then
+			checkQueues()
+		end
+	end
+end)
+
+------------------------------------------------------------------------
 -- Init
 ------------------------------------------------------------------------
 
--- Listen for kills from CombatHandler via BindableEvent
 onPlayerKill.Event:Connect(function(killer: Player, victim: Player)
 	onKillDuringMatch(killer, victim)
 end)
@@ -644,9 +886,8 @@ end)
 Players.PlayerAdded:Connect(onPlayerAdded)
 Players.PlayerRemoving:Connect(onPlayerRemoving)
 
--- Handle players already in the server
 for _, player in Players:GetPlayers() do
 	task.spawn(onPlayerAdded, player)
 end
 
-print("[GameManager] Initialized")
+print("[GameManager] Initialized — queue-based match system active")
