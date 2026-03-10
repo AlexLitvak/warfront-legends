@@ -22,18 +22,46 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
+local Workspace = game:GetService("Workspace")
 
 local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
 local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
 
 ------------------------------------------------------------------------
+-- Lobby platform (so players don't fall into the void)
+------------------------------------------------------------------------
+
+local lobbyPlatform = Instance.new("Part")
+lobbyPlatform.Name = "LobbyPlatform"
+lobbyPlatform.Size = Vector3.new(100, 3, 100)
+lobbyPlatform.Position = Vector3.new(0, -1.5, 0)
+lobbyPlatform.Anchored = true
+lobbyPlatform.Material = Enum.Material.SmoothPlastic
+lobbyPlatform.Color = Color3.fromRGB(40, 40, 50)
+lobbyPlatform.TopSurface = Enum.SurfaceType.Smooth
+lobbyPlatform.BottomSurface = Enum.SurfaceType.Smooth
+lobbyPlatform.Parent = Workspace
+
+local lobbySpawn = Instance.new("SpawnLocation")
+lobbySpawn.Name = "LobbySpawn"
+lobbySpawn.Size = Vector3.new(8, 1, 8)
+lobbySpawn.Position = Vector3.new(0, 0.5, 0)
+lobbySpawn.Anchored = true
+lobbySpawn.Transparency = 1
+lobbySpawn.CanCollide = false
+lobbySpawn.Neutral = true
+lobbySpawn.Parent = Workspace
+
+------------------------------------------------------------------------
 -- Constants
 ------------------------------------------------------------------------
 
-local COUNTDOWN_DURATION = 5
+local DEV_MODE = true -- Set to false for production
+
+local COUNTDOWN_DURATION = if DEV_MODE then 2 else 5
 local RESULTS_DURATION = 10
 local TIMER_TICK = 1
-local QUEUE_TIMEOUT_FFA = 60 -- seconds before FFA starts with min players
+local QUEUE_TIMEOUT_FFA = if DEV_MODE then 0 else 60 -- seconds before FFA starts with min players
 
 ------------------------------------------------------------------------
 -- Game mode definitions
@@ -51,7 +79,7 @@ local MODE_CONFIG: { [GameMode]: {
 	teamCount: number,
 } } = {
 	FFA = {
-		minPlayers = 4,
+		minPlayers = if DEV_MODE then 1 else 4,
 		maxPlayers = GameConfig.MAX_PLAYERS_FFA,
 		matchDuration = GameConfig.MATCH_DURATION_FFA,
 		killThreshold = GameConfig.KILL_THRESHOLD_FFA,
@@ -60,21 +88,21 @@ local MODE_CONFIG: { [GameMode]: {
 		teamCount = 0,
 	},
 	["2v2"] = {
-		minPlayers = 4,
-		maxPlayers = GameConfig.MAX_PLAYERS_2V2,
+		minPlayers = if DEV_MODE then 1 else 4,
+		maxPlayers = if DEV_MODE then 1 else GameConfig.MAX_PLAYERS_2V2,
 		matchDuration = GameConfig.MATCH_DURATION_TEAM,
 		killThreshold = GameConfig.KILL_THRESHOLD_2V2,
 		respawnTime = GameConfig.RESPAWN_TIME_TEAM,
-		teamSize = 2,
+		teamSize = if DEV_MODE then 1 else 2,
 		teamCount = 2,
 	},
 	["3v3"] = {
-		minPlayers = 6,
-		maxPlayers = GameConfig.MAX_PLAYERS_3V3,
+		minPlayers = if DEV_MODE then 1 else 6,
+		maxPlayers = if DEV_MODE then 1 else GameConfig.MAX_PLAYERS_3V3,
 		matchDuration = GameConfig.MATCH_DURATION_TEAM,
 		killThreshold = GameConfig.KILL_THRESHOLD_3V3,
 		respawnTime = GameConfig.RESPAWN_TIME_TEAM,
-		teamSize = 3,
+		teamSize = if DEV_MODE then 1 else 3,
 		teamCount = 2,
 	},
 }
@@ -504,7 +532,7 @@ launchMatch = function(mode: GameMode, playerCount: number)
 	setPhase("Generating")
 	broadcastMatchState({})
 
-	local arenaType = selectArenaFunc:Invoke("random")
+	local arenaType = selectArenaFunc:Invoke(if DEV_MODE then "JungleRuins" else "random")
 	currentArenaType = arenaType
 	local arenaFolder = setupArenaFunc:Invoke(arenaType)
 	currentArenaFolder = arenaFolder
@@ -520,6 +548,11 @@ launchMatch = function(mode: GameMode, playerCount: number)
 		setPhase("Lobby")
 		return
 	end
+
+	-- Hide lobby platform during match
+	lobbyPlatform.Transparency = 1
+	lobbyPlatform.CanCollide = false
+	lobbySpawn.Enabled = false
 
 	-- Spawn all match players in the arena
 	spawnMatchPlayersEvent:Fire(matchPlayers, arenaFolder)
@@ -548,9 +581,12 @@ runCountdown = function()
 				alive += 1
 			end
 		end
-		if alive < 2 then
+		if alive < MODE_CONFIG[currentGameMode].minPlayers then
 			print("[GameManager] Not enough players during countdown, aborting")
 			cleanupArenaEvent:Fire()
+			lobbyPlatform.Transparency = 0
+			lobbyPlatform.CanCollide = true
+			lobbySpawn.Enabled = true
 			matchPlayers = {}
 			playerStats = {}
 			teamAssignments = {}
@@ -687,6 +723,11 @@ runResults = function()
 
 	-- Cleanup
 	cleanupArenaEvent:Fire()
+
+	-- Restore lobby platform
+	lobbyPlatform.Transparency = 0
+	lobbyPlatform.CanCollide = true
+	lobbySpawn.Enabled = true
 
 	-- Respawn all match players for lobby
 	for _, player in matchPlayers do
@@ -852,7 +893,7 @@ local function onPlayerRemoving(player: Player)
 				alive += 1
 			end
 		end
-		if alive < 2 then
+		if alive < MODE_CONFIG[currentGameMode].minPlayers then
 			if matchLoopThread then
 				task.cancel(matchLoopThread)
 				matchLoopThread = nil

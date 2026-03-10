@@ -193,17 +193,16 @@ SpawnMatchPlayersEvent.Event:Connect(function(players: { Player }, arenaFolder: 
 		local spawnIndex = ((i - 1) % #spawnLocations) + 1
 		local spawn = spawnLocations[spawnIndex]
 
-		-- Ensure the player has a loaded character
-		if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then
-			player:LoadCharacter()
-			if not player.Character then
-				player.CharacterAdded:Wait()
-			end
-			-- Wait for HumanoidRootPart to exist
-			local character = player.Character
-			if character and not character:FindFirstChild("HumanoidRootPart") then
-				character:WaitForChild("HumanoidRootPart", 5)
-			end
+		-- Always load a fresh character to avoid falling-through-void issues
+		-- (the lobby platform is disabled before this handler runs)
+		player:LoadCharacter()
+		if not player.Character then
+			player.CharacterAdded:Wait()
+		end
+		-- Wait for HumanoidRootPart to exist
+		local character = player.Character
+		if character and not character:FindFirstChild("HumanoidRootPart") then
+			character:WaitForChild("HumanoidRootPart", 5)
 		end
 
 		local character = player.Character

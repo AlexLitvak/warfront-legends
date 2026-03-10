@@ -3,8 +3,8 @@
 local GameConfig = {}
 
 -- Match Settings
-GameConfig.MATCH_DURATION_FFA = 480            -- 8 minutes (seconds)
-GameConfig.MATCH_DURATION_TEAM = 600           -- 10 minutes (seconds)
+GameConfig.MATCH_DURATION_FFA = 1800            -- 30 minutes (seconds)
+GameConfig.MATCH_DURATION_TEAM = 1800           -- 30 minutes (seconds)
 GameConfig.MAX_PLAYERS_FFA = 10
 GameConfig.MAX_PLAYERS_2V2 = 4
 GameConfig.MAX_PLAYERS_3V3 = 6

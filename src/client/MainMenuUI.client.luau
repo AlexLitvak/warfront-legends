@@ -947,11 +947,20 @@ playBtn.MouseButton1Click:Connect(function()
 end)
 
 shopBtn.MouseButton1Click:Connect(function()
-	-- Toggle ShopUI via B key simulation (ShopUI listens for B key)
-	-- We fire the shop open by toggling the existing ShopUI
+	-- Open ShopUI by firing the toggle remote or simulating B key
 	local shopGui = player:FindFirstChild("PlayerGui") and (player.PlayerGui :: PlayerGui):FindFirstChild("ShopUI")
 	if shopGui then
-		(shopGui :: ScreenGui).Enabled = not (shopGui :: ScreenGui).Enabled
+		-- Fire a BindableEvent so ShopUI manages its own state
+		local toggleEvent = shopGui:FindFirstChild("ToggleShop")
+		if toggleEvent and toggleEvent:IsA("BindableEvent") then
+			toggleEvent:Fire()
+		else
+			-- Fallback: create the event for ShopUI to pick up
+			local evt = Instance.new("BindableEvent")
+			evt.Name = "ToggleShop"
+			evt.Parent = shopGui
+			evt:Fire()
+		end
 	end
 end)
 

@@ -632,6 +632,15 @@ end
 closeBtn.MouseButton1Click:Connect(closeShop)
 
 ------------------------------------------------------------------------
+-- BindableEvent: MainMenuUI can toggle shop through proper state
+------------------------------------------------------------------------
+
+local toggleEvent = Instance.new("BindableEvent")
+toggleEvent.Name = "ToggleShop"
+toggleEvent.Parent = screenGui
+toggleEvent.Event:Connect(toggleShop)
+
+------------------------------------------------------------------------
 -- Input binding: B key to toggle
 ------------------------------------------------------------------------
 
