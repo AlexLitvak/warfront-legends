@@ -235,6 +235,72 @@ local function getMeleeTargets(attacker: Player, range: number): { Player }
 end
 
 ------------------------------------------------------------------------
+-- NPC (Bear) melee hit detection
+------------------------------------------------------------------------
+
+local function getMeleeNPCTargets(attacker: Player, range: number): { Humanoid }
+	local rootPart = getRootPart(attacker)
+	if not rootPart then return {} end
+
+	local origin = rootPart.Position
+	local lookDir = rootPart.CFrame.LookVector
+	local halfArc = math.rad(70)
+	local hits: { Humanoid } = {}
+
+	local arenaFolder = workspace:FindFirstChild("Arena")
+	local wildlifeFolder = arenaFolder and arenaFolder:FindFirstChild("AmbientWildlife")
+	if not wildlifeFolder then return {} end
+
+	for _, npc in wildlifeFolder:GetChildren() do
+		if not npc:IsA("Model") then continue end
+		local npcHumanoid = npc:FindFirstChildOfClass("Humanoid")
+		local npcRoot = npc:FindFirstChild("HumanoidRootPart") :: BasePart?
+		if not npcHumanoid or not npcRoot or npcHumanoid.Health <= 0 then continue end
+
+		local toNPC = npcRoot.Position - origin
+		if toNPC.Magnitude > range then continue end
+
+		local flat = Vector3.new(toNPC.X, 0, toNPC.Z)
+		if flat.Magnitude > 0 then
+			local lookFlat = Vector3.new(lookDir.X, 0, lookDir.Z).Unit
+			local angle = math.acos(math.clamp(lookFlat:Dot(flat.Unit), -1, 1))
+			if angle <= halfArc then
+				table.insert(hits, npcHumanoid)
+			end
+		end
+	end
+	return hits
+end
+
+------------------------------------------------------------------------
+-- NPC (Bear) AoE hit detection
+------------------------------------------------------------------------
+
+local function getAoENPCTargets(attacker: Player, radius: number): { Humanoid }
+	local rootPart = getRootPart(attacker)
+	if not rootPart then return {} end
+
+	local origin = rootPart.Position
+	local hits: { Humanoid } = {}
+
+	local arenaFolder = workspace:FindFirstChild("Arena")
+	local wildlifeFolder = arenaFolder and arenaFolder:FindFirstChild("AmbientWildlife")
+	if not wildlifeFolder then return {} end
+
+	for _, npc in wildlifeFolder:GetChildren() do
+		if not npc:IsA("Model") then continue end
+		local npcHumanoid = npc:FindFirstChildOfClass("Humanoid")
+		local npcRoot = npc:FindFirstChild("HumanoidRootPart") :: BasePart?
+		if not npcHumanoid or not npcRoot or npcHumanoid.Health <= 0 then continue end
+
+		if (npcRoot.Position - origin).Magnitude <= radius then
+			table.insert(hits, npcHumanoid)
+		end
+	end
+	return hits
+end
+
+------------------------------------------------------------------------
 -- AoE hit detection (360 degree radius, used by Earthshaker)
 ------------------------------------------------------------------------
 
@@ -275,7 +341,7 @@ end
 -- Ranged hit detection (raycasting, used by Bow)
 ------------------------------------------------------------------------
 
-local function getRangedTarget(attacker: Player, targetPosition: Vector3, maxRange: number): (Player?, boolean)
+local function getRangedTarget(attacker: Player, targetPosition: Vector3, maxRange: number): (Player?, boolean, Model?)
 	local character = attacker.Character
 	if not character then
 		return nil, false
@@ -321,7 +387,7 @@ local function getRangedTarget(attacker: Player, targetPosition: Vector3, maxRan
 	end
 
 	if not hitPlayer then
-		return nil, false
+		return nil, false, hitModel
 	end
 
 	if not isAlive(hitPlayer) then
@@ -450,6 +516,20 @@ local function handleEarthshaker(attacker: Player, state: PlayerCombatState)
 				bodyVelocity:Destroy()
 			end)
 		end
+	end
+
+	-- Also damage NPC bears in the AoE
+	local npcAoETargets = getAoENPCTargets(attacker, radius)
+	for _, npcHumanoid in npcAoETargets do
+		npcHumanoid:TakeDamage(aoeDamage)
+		if npcHumanoid.Parent then
+			npcHumanoid.Parent:SetAttribute("LastAttacker", attacker.UserId)
+		end
+		Remotes.DamageDealt:FireClient(attacker, {
+			targetName = "Bear",
+			damage = aoeDamage,
+			isHit = true,
+		})
 	end
 
 	-- Notify all nearby players of the slam effect
@@ -683,6 +763,20 @@ local function onAttackInput(player: Player, attackData: { [string]: any })
 			applyDamage(player, target, damage)
 		end
 
+		-- Also check NPC targets (bears)
+		local npcTargets = getMeleeNPCTargets(player, weaponStats.range)
+		for _, npcHumanoid in npcTargets do
+			npcHumanoid:TakeDamage(weaponStats.damage)
+			if npcHumanoid.Parent then
+				npcHumanoid.Parent:SetAttribute("LastAttacker", player.UserId)
+			end
+			Remotes.DamageDealt:FireClient(player, {
+				targetName = "Bear",
+				damage = weaponStats.damage,
+				isHit = true,
+			})
+		end
+
 	elseif weaponStats.weaponType == "Ranged" then
 		-- Bow: raycast from head toward target position
 		local targetPos = attackData.targetPosition :: Vector3?
@@ -695,7 +789,7 @@ local function onAttackInput(player: Player, attackData: { [string]: any })
 			return
 		end
 
-		local hitPlayer, isHeadshot = getRangedTarget(player, targetPos, weaponStats.range)
+		local hitPlayer, isHeadshot, hitModel = getRangedTarget(player, targetPos, weaponStats.range)
 		if hitPlayer then
 			local damage = weaponStats.damage
 			local effectivePerk = getEffectivePerk(player, state.equippedWeapon)
@@ -724,6 +818,21 @@ local function onAttackInput(player: Player, attackData: { [string]: any })
 					perk = "Headshot",
 					targetName = hitPlayer.Name,
 				})
+			end
+		elseif hitModel then
+			-- Check if we hit an NPC bear
+			local npcHumanoid = hitModel:FindFirstChildOfClass("Humanoid")
+			if npcHumanoid and npcHumanoid.Health > 0 then
+				local wildlifeFolder = hitModel:FindFirstAncestorOfClass("Folder")
+				if wildlifeFolder and wildlifeFolder.Name == "AmbientWildlife" then
+					npcHumanoid:TakeDamage(weaponStats.damage)
+					hitModel:SetAttribute("LastAttacker", player.UserId)
+					Remotes.DamageDealt:FireClient(player, {
+						targetName = "Bear",
+						damage = weaponStats.damage,
+						isHit = true,
+					})
+				end
 			end
 		end
 	end

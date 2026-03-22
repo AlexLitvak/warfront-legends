@@ -45,6 +45,22 @@ GameConfig.SHADOW_MAZE_WALL_SHIFT = 180        -- seconds
 GameConfig.JUNGLE_DART_DAMAGE = 15
 GameConfig.JUNGLE_LOG_DAMAGE = 25
 
+-- Bear NPCs (Jungle Ruins)
+GameConfig.BEAR_HEALTH = 200
+GameConfig.BEAR_ATTACK_DAMAGE = 30
+GameConfig.BEAR_ATTACK_COOLDOWN = 1.5
+GameConfig.BEAR_DETECTION_RANGE = 40
+GameConfig.BEAR_AGGRO_RANGE = 25
+GameConfig.BEAR_CHASE_RANGE = 80
+GameConfig.BEAR_ATTACK_RANGE = 8
+GameConfig.BEAR_WALK_SPEED = 6
+GameConfig.BEAR_CHARGE_SPEED = 20
+GameConfig.BEAR_RESPAWN_DELAY = 45
+GameConfig.COINS_PER_BEAR_KILL = 15
+GameConfig.BEAR_FIGHT_RANGE = 15
+GameConfig.BEAR_FIGHT_DAMAGE = 20
+GameConfig.BEAR_FLEE_THRESHOLD = 0.3
+
 -- Admin: Ethan Template
 GameConfig.ADMIN_FROST_DURATION = 10            -- seconds
 GameConfig.ADMIN_REVERSE_GRAVITY_DURATION = 180 -- 3 minutes (seconds)

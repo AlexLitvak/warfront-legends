@@ -17,9 +17,11 @@
 local ServerStorage = game:GetService("ServerStorage")
 local CollectionService = game:GetService("CollectionService")
 local Lighting = game:GetService("Lighting")
+local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local ArenaConfig = require(game:GetService("ReplicatedStorage"):WaitForChild("ArenaConfig"))
+local AmbientWildlife = require(game:GetService("ServerScriptService"):WaitForChild("AmbientWildlife"))
 
 ------------------------------------------------------------------------
 -- Types
@@ -40,6 +42,9 @@ export type GenerationResult = {
 
 local ArenaGenerator = {}
 
+-- Active Jungle Ruins sunlight animation connection (disconnected on clearArena)
+local jungleSunConnection: RBXScriptConnection? = nil
+
 ------------------------------------------------------------------------
 -- Constants
 ------------------------------------------------------------------------
@@ -47,6 +52,11 @@ local ArenaGenerator = {}
 local PLACEHOLDER_COLOR = Color3.fromRGB(255, 105, 180) -- hot pink
 local PLACEHOLDER_MATERIAL = Enum.Material.SmoothPlastic
 local ARENA_FOLDER_NAME = "Arena"
+
+-- Sound asset IDs — upload your own audio via Roblox Studio Asset Manager,
+-- then paste the rbxassetid:// URLs here. Leave "" to disable.
+local FOREST_SOUND_ID = "rbxassetid://9113444290"
+local WATER_SOUND_ID = ""  -- e.g. "rbxassetid://YOUR_WATER_AMBIENT_ID"
 
 -- Placeholder sizes by name pattern (studs)
 -- Order matters: more specific patterns checked first via string.find
@@ -83,10 +93,6 @@ local PLACEHOLDER_SIZES: { [string]: Vector3 } = {
 	StoneStaircase   = Vector3.new(12, 8, 6),
 	StoneBoulder     = Vector3.new(4, 3, 4),
 	BrokenStatue     = Vector3.new(4, 6, 3),
-	TreeLarge        = Vector3.new(8, 20, 8),
-	TreeSmall        = Vector3.new(4, 12, 4),
-	BushCluster      = Vector3.new(5, 3, 5),
-	TallGrass        = Vector3.new(6, 2, 6),
 	ClimbableVine    = Vector3.new(2, 12, 1),
 	PressurePlate    = Vector3.new(4, 0.5, 4),
 	DartTrap         = Vector3.new(2, 2, 2),
@@ -95,6 +101,8 @@ local PLACEHOLDER_SIZES: { [string]: Vector3 } = {
 	RopeBridge       = Vector3.new(24, 1, 4),
 	TempleBase       = Vector3.new(36, 15, 36),
 	Firefly          = Vector3.new(1, 1, 1),
+	-- Wildlife NPCs
+	Bear             = Vector3.new(5, 6, 8),
 	-- Generic
 	Floor            = Vector3.new(12, 1, 12),
 	Wall             = Vector3.new(12, 12, 2),
@@ -1765,12 +1773,12 @@ end
 --- courtyard, or elevated_ruins. Includes traps, dense vegetation, rope
 --- bridges between elevated areas, and ambient environmental details.
 local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, prefabFolder: Folder?)
-	print("[JungleRuins v4] === GENERATING JUNGLE RUINS (LATEST VERSION) ===")
-	print("[JungleRuins v4] General Sherman trees, solid lakes, no waterfalls, 2x tree density")
+	print("[JungleRuins v5] === GENERATING JUNGLE RUINS (LATEST VERSION) ===")
+	print("[JungleRuins v5] FillCylinder water (no FillBall), visible ground fog, 2x tree density")
 	local halfW = (arenaData.bounds.width or 2000) / 2
 	local halfD = (arenaData.bounds.depth or 2000) / 2
 	local terrain = Workspace.Terrain
-	print("[JungleRuins v4] halfW=" .. halfW .. " halfD=" .. halfD)
+	print("[JungleRuins v5] halfW=" .. halfW .. " halfD=" .. halfD)
 
 	local ZONE_SIZE = 100
 	local ZONE_COUNT = 10
@@ -1914,24 +1922,50 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 	}
 
 	--- Build a procedural tall grass cluster at the given position.
+	local grassPrefabs: { Instance } = {}
+	if prefabFolder then
+		local grassFolder = prefabFolder:FindFirstChild("Grass")
+		if grassFolder then
+			grassPrefabs = grassFolder:GetChildren()
+		end
+	end
+	if #grassPrefabs == 0 then
+		warn("[ArenaGenerator] No grass prefabs found in ArenaPrefabs/" .. arenaData.prefabFolder .. "/Grass")
+	end
+
 	local function buildGrassCluster(position: Vector3)
-		for _ = 1, rng:NextInteger(3, 6) do
-			local blade = Instance.new("Part")
-			blade.Name = "TallGrass"
-			blade.Size = Vector3.new(
-				rng:NextNumber(0.3, 0.8),
-				rng:NextNumber(3, 7),
-				rng:NextNumber(0.3, 0.8)
-			)
+		if #grassPrefabs == 0 then
+			return
+		end
+
+		-- Place 2-4 small grass prefabs near the position
+		for _ = 1, rng:NextInteger(2, 4) do
+			local prefab = grassPrefabs[rng:NextInteger(1, #grassPrefabs)]
+			local clone = prefab:Clone()
 			local offsetX = rng:NextNumber(-2, 2)
 			local offsetZ = rng:NextNumber(-2, 2)
-			blade.Position = position + Vector3.new(offsetX, blade.Size.Y / 2, offsetZ)
-			blade.Color = CANOPY_COLORS[rng:NextInteger(1, #CANOPY_COLORS)]
-			blade.Material = Enum.Material.Grass
-			blade.Anchored = true
-			blade.CanCollide = false
-			blade.CastShadow = false
-			blade.Parent = arenaFolder
+			local clonePos = position + Vector3.new(offsetX, 0, offsetZ)
+			local randomRotation = CFrame.Angles(0, rng:NextNumber(0, 2 * math.pi), 0)
+			local randomScale = rng:NextNumber(0.03, 0.07)
+
+			if clone:IsA("Model") then
+				clone:ScaleTo(randomScale)
+				-- After scaling, place base on terrain
+				local _, size = clone:GetBoundingBox()
+				clone:PivotTo(CFrame.new(clonePos + Vector3.new(0, size.Y / 2, 0)) * randomRotation)
+			elseif clone:IsA("BasePart") then
+				clone.Size = clone.Size * randomScale
+				clone.CFrame = CFrame.new(clonePos + Vector3.new(0, clone.Size.Y / 2, 0)) * randomRotation
+			end
+
+			-- Enable any scripts inside (e.g. moving_grass sway script)
+			for _, desc in clone:GetDescendants() do
+				if desc:IsA("Script") then
+					desc.Disabled = false
+				end
+			end
+
+			clone.Parent = arenaFolder
 		end
 	end
 
@@ -1971,10 +2005,13 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 	local function buildBoulder(position: Vector3)
 		local boulder = Instance.new("Part")
 		boulder.Name = "StoneBoulder"
-		boulder.Shape = Enum.PartType.Ball
-		local size = rng:NextNumber(3, 8)
-		boulder.Size = Vector3.new(size, size * 0.7, size)
-		boulder.Position = position + Vector3.new(0, size * 0.3, 0)
+		boulder.Shape = Enum.PartType.Block
+		local sizeX = rng:NextNumber(3, 8)
+		local sizeY = sizeX * rng:NextNumber(0.4, 0.7)
+		local sizeZ = sizeX * rng:NextNumber(0.6, 1.1)
+		boulder.Size = Vector3.new(sizeX, sizeY, sizeZ)
+		boulder.CFrame = CFrame.new(position + Vector3.new(0, sizeY * 0.3, 0))
+			* CFrame.Angles(0, rng:NextNumber(0, math.pi * 2), 0)
 		boulder.Color = STONE_COLORS[rng:NextInteger(1, #STONE_COLORS)]
 		boulder.Material = Enum.Material.Slate
 		boulder.Anchored = true
@@ -1982,112 +2019,127 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 		boulder.Parent = arenaFolder
 	end
 
-	local function buildTree(position: Vector3, treeType: string): Model
-		local model = Instance.new("Model")
-		model.Name = "JungleTree"
+	local treePrefabs: { Instance } = {}
+	if prefabFolder then
+		local treesFolder = prefabFolder:FindFirstChild("Trees")
+		if treesFolder then
+			treePrefabs = treesFolder:GetChildren()
+		end
+	end
+	if #treePrefabs == 0 then
+		warn("[ArenaGenerator] No tree prefabs found in ArenaPrefabs/" .. arenaData.prefabFolder .. "/Trees")
+	end
 
-		local height, trunkRadius, canopyRadius, canopyCount
-		if treeType == "large" then
-			height = rng:NextNumber(75, 125)
-			trunkRadius = rng:NextNumber(4, 7)
-			canopyRadius = rng:NextNumber(20, 30)
-			canopyCount = rng:NextInteger(8, 14)
-		elseif treeType == "small" then
-			height = rng:NextNumber(30, 55)
-			trunkRadius = rng:NextNumber(2, 3.5)
-			canopyRadius = rng:NextNumber(10, 18)
-			canopyCount = rng:NextInteger(5, 8)
-		else -- "mountain"
-			height = rng:NextNumber(40, 75)
-			trunkRadius = rng:NextNumber(2.5, 5)
-			canopyRadius = rng:NextNumber(12, 22)
-			canopyCount = rng:NextInteger(6, 10)
+	local bushPrefabs: { Instance } = {}
+	if prefabFolder then
+		local bushesFolder = prefabFolder:FindFirstChild("Bushes")
+		if bushesFolder then
+			bushPrefabs = bushesFolder:GetChildren()
+		end
+	end
+	if #bushPrefabs == 0 then
+		warn("[ArenaGenerator] No bush prefabs found in ArenaPrefabs/" .. arenaData.prefabFolder .. "/Bushes")
+	end
+
+	-- Forward declaration: populated later during lake/river generation
+	local waterRegions: { { x: number, z: number, radius: number } } = {}
+
+	local function buildBush(position: Vector3)
+		if #bushPrefabs == 0 then
+			return
 		end
 
-		local trunkColor = TRUNK_COLORS[rng:NextInteger(1, #TRUNK_COLORS)]
-
-		-- Trunk (cylinder standing vertical)
-		local trunkHeight = height * 0.65
-		local trunk = Instance.new("Part")
-		trunk.Name = "Trunk"
-		trunk.Shape = Enum.PartType.Cylinder
-		trunk.Size = Vector3.new(trunkHeight, trunkRadius * 2, trunkRadius * 2)
-		trunk.CFrame = CFrame.new(position + Vector3.new(0, trunkHeight / 2, 0))
-			* CFrame.Angles(0, 0, math.pi / 2)
-		trunk.Color = trunkColor
-		trunk.Material = Enum.Material.Wood
-		trunk.Anchored = true
-		trunk.CanCollide = true
-		trunk.Parent = model
-
-		-- Main canopy sphere
-		local canopyY = position.Y + height * 0.6
-		local canopyCenter = Vector3.new(position.X, canopyY, position.Z)
-
-		local mainCanopy = Instance.new("Part")
-		mainCanopy.Name = "Canopy"
-		mainCanopy.Shape = Enum.PartType.Ball
-		mainCanopy.Size = Vector3.new(canopyRadius * 2, canopyRadius * 1.6, canopyRadius * 2)
-		mainCanopy.Position = canopyCenter
-		mainCanopy.Color = CANOPY_COLORS[rng:NextInteger(1, #CANOPY_COLORS)]
-		mainCanopy.Material = Enum.Material.Grass
-		mainCanopy.Anchored = true
-		mainCanopy.CanCollide = false
-		mainCanopy.CastShadow = true
-		mainCanopy.Parent = model
-
-		-- Additional canopy clusters for lush look
-		for _ = 1, canopyCount do
-			local offsetX = rng:NextNumber(-canopyRadius * 0.7, canopyRadius * 0.7)
-			local offsetY = rng:NextNumber(-canopyRadius * 0.4, canopyRadius * 0.5)
-			local offsetZ = rng:NextNumber(-canopyRadius * 0.7, canopyRadius * 0.7)
-			local subRadius = canopyRadius * rng:NextNumber(0.4, 0.75)
-
-			local sub = Instance.new("Part")
-			sub.Name = "Canopy"
-			sub.Shape = Enum.PartType.Ball
-			sub.Size = Vector3.new(subRadius * 2, subRadius * 1.5, subRadius * 2)
-			sub.Position = canopyCenter + Vector3.new(offsetX, offsetY, offsetZ)
-			sub.Color = CANOPY_COLORS[rng:NextInteger(1, #CANOPY_COLORS)]
-			sub.Material = Enum.Material.Grass
-			sub.Anchored = true
-			sub.CanCollide = false
-			sub.CastShadow = true
-			sub.Parent = model
+		-- Skip if position is inside a water region (lake or river)
+		for _, wr in waterRegions do
+			local dx = position.X - wr.x
+			local dz = position.Z - wr.z
+			if dx * dx + dz * dz < wr.radius * wr.radius then
+				return
+			end
 		end
 
-		-- Branch stubs connecting trunk to canopy
-		local branchCount = rng:NextInteger(2, 4)
-		for _ = 1, branchCount do
-			local branchAngle = rng:NextNumber(0, 2 * math.pi)
-			local branchY = position.Y + trunkHeight * rng:NextNumber(0.6, 0.95)
-			local branchLen = canopyRadius * rng:NextNumber(0.5, 0.9)
-			local branchRadius = trunkRadius * rng:NextNumber(0.3, 0.6)
-			local branchDir = Vector3.new(math.cos(branchAngle), 0.3, math.sin(branchAngle)).Unit
+		local prefab = bushPrefabs[rng:NextInteger(1, #bushPrefabs)]
+		local clone = prefab:Clone()
+		local randomRotation = CFrame.Angles(0, rng:NextNumber(0, 2 * math.pi), 0)
+		local randomScale = rng:NextNumber(0.7, 1.3)
 
-			local branch = Instance.new("Part")
-			branch.Name = "Branch"
-			branch.Shape = Enum.PartType.Cylinder
-			branch.Size = Vector3.new(branchLen, branchRadius * 2, branchRadius * 2)
-			local branchStart = Vector3.new(position.X, branchY, position.Z)
-			local branchMid = branchStart + branchDir * (branchLen / 2)
-			local lookCF = CFrame.lookAt(branchStart, branchStart + branchDir)
-			branch.CFrame = CFrame.new(branchMid) * lookCF.Rotation * CFrame.Angles(0, 0, math.pi / 2)
-			branch.Color = trunkColor
-			branch.Material = Enum.Material.Wood
-			branch.Anchored = true
-			branch.CanCollide = false
-			branch.Parent = model
+		if clone:IsA("Model") then
+			local cf, size = clone:GetBoundingBox()
+			local bottomY = cf.Position.Y - size.Y / 2
+			local pivotY = clone:GetPivot().Position.Y
+			local yOffset = pivotY - bottomY
+
+			clone:PivotTo(CFrame.new(position + Vector3.new(0, yOffset, 0)) * randomRotation)
+
+			-- Apply random scale
+			if randomScale ~= 1 then
+				clone:ScaleTo(randomScale)
+			end
+		elseif clone:IsA("BasePart") then
+			local yOffset = clone.Size.Y / 2
+			clone.CFrame = CFrame.new(position + Vector3.new(0, yOffset, 0)) * randomRotation
+			clone.Size = clone.Size * randomScale
+		end
+		clone.Parent = arenaFolder
+	end
+
+	local function buildTree(position: Vector3, treeType: string): Model?
+		if #treePrefabs == 0 then
+			return nil
 		end
 
-		model.Parent = arenaFolder
-		return model
+		-- On flat/gentle slopes, sink to lowest nearby height to embed trunk.
+		-- On mountain slopes, just use the given position to avoid burying
+		-- trees underground due to large elevation differences.
+		local plantPos
+		if treeType == "mountain" then
+			-- Mountain slopes are steep; use position directly
+			plantPos = position
+		else
+			local slopeDist = 6
+			local lowestY = position.Y
+			for _, offset in {
+				Vector3.new(slopeDist, 0, 0),
+				Vector3.new(-slopeDist, 0, 0),
+				Vector3.new(0, 0, slopeDist),
+				Vector3.new(0, 0, -slopeDist),
+			} do
+				local hSample = getTerrainHeight(position.X + offset.X, position.Z + offset.Z)
+				lowestY = math.min(lowestY, hSample)
+			end
+			plantPos = Vector3.new(position.X, lowestY, position.Z)
+		end
+
+		local prefab = treePrefabs[rng:NextInteger(1, #treePrefabs)]
+
+		local clone = prefab:Clone()
+		local randomRotation = CFrame.Angles(0, rng:NextNumber(0, 2 * math.pi), 0)
+
+		-- Calculate how far below the pivot the model extends,
+		-- so we can offset upward and sit the base on the terrain surface
+		local yOffset = 0
+		if clone:IsA("Model") then
+			local _, size = clone:GetBoundingBox()
+			local pivot = clone:GetPivot()
+			-- Assume the pivot is near center; offset up by half the model height
+			-- so the bottom rests on the ground
+			local cf, _ = clone:GetBoundingBox()
+			local bottomY = cf.Position.Y - size.Y / 2
+			local pivotY = pivot.Position.Y
+			yOffset = pivotY - bottomY
+			clone:PivotTo(CFrame.new(plantPos + Vector3.new(0, yOffset, 0)) * randomRotation)
+		elseif clone:IsA("BasePart") then
+			yOffset = clone.Size.Y / 2
+			clone.CFrame = CFrame.new(plantPos + Vector3.new(0, yOffset, 0)) * randomRotation
+		end
+		clone.Parent = arenaFolder
+		return clone :: Model
 	end
 
 	--------------------------------------------------------------------
 	-- 1. BASE TERRAIN
 	--------------------------------------------------------------------
-	print("[JungleRuins v4] Step 1: Filling base terrain slab...")
+	print("[JungleRuins v5] Step 1: Filling base terrain slab...")
 
 	terrain:FillBlock(
 		CFrame.new(0, -10, 0),
@@ -2096,62 +2148,200 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 	)
 
 	--------------------------------------------------------------------
-	-- 2. MOUNTAIN BORDERS
+	-- 2. MOUNTAIN BORDERS (Perlin noise heightmap)
 	--------------------------------------------------------------------
-	print("[JungleRuins v4] Step 2: Building mountain borders (200 studs tall)...")
+	print("[JungleRuins v5] Step 2: Generating noise-based mountain borders...")
 
-	local mHeight = 200
 	local mThick = 150
+	local noiseSeed = rng:NextNumber(0, 10000)
 
-	terrain:FillBlock(
-		CFrame.new(0, mHeight / 2, -halfD - mThick / 2),
-		Vector3.new(halfW * 2 + mThick * 2, mHeight, mThick),
-		Enum.Material.Grass
-	)
-	terrain:FillBlock(
-		CFrame.new(0, mHeight / 2, halfD + mThick / 2),
-		Vector3.new(halfW * 2 + mThick * 2, mHeight, mThick),
-		Enum.Material.Grass
-	)
-	terrain:FillBlock(
-		CFrame.new(-halfW - mThick / 2, mHeight / 2, 0),
-		Vector3.new(mThick, mHeight, halfD * 2 + mThick * 2),
-		Enum.Material.Grass
-	)
-	terrain:FillBlock(
-		CFrame.new(halfW + mThick / 2, mHeight / 2, 0),
-		Vector3.new(mThick, mHeight, halfD * 2 + mThick * 2),
-		Enum.Material.Grass
-	)
+	-- Mountain height for any point in the border zone
+	local function getMountainHeight(x: number, z: number): number
+		-- Distance into the border from the arena edge
+		local distBeyondX = math.abs(x) - halfW
+		local distBeyondZ = math.abs(z) - halfD
+		local distBeyondEdge = math.max(distBeyondX, distBeyondZ)
 
-	-- Irregular mountain peaks
-	for _ = 1, 80 do
-		local side = rng:NextInteger(1, 4)
-		local x, z
-		if side == 1 then
-			x = rng:NextNumber(-halfW - 50, halfW + 50)
-			z = -halfD - rng:NextNumber(10, mThick - 10)
-		elseif side == 2 then
-			x = rng:NextNumber(-halfW - 50, halfW + 50)
-			z = halfD + rng:NextNumber(10, mThick - 10)
-		elseif side == 3 then
-			x = -halfW - rng:NextNumber(10, mThick - 10)
-			z = rng:NextNumber(-halfD - 50, halfD + 50)
-		else
-			x = halfW + rng:NextNumber(10, mThick - 10)
-			z = rng:NextNumber(-halfD - 50, halfD + 50)
+		if distBeyondEdge <= 0 then
+			return 0
 		end
-		local radius = rng:NextNumber(30, 80)
-		local y = mHeight + rng:NextNumber(-20, 60)
-		terrain:FillBall(Vector3.new(x, y, z), radius, Enum.Material.Grass)
+
+		-- Two layers of domain warping to thoroughly break up all banding.
+		-- Layer 1: large-scale warp
+		local warp1 = 90
+		local wx = x + math.noise(x / 130 + noiseSeed + 900, z / 130 + noiseSeed + 900) * warp1
+		local wz = z + math.noise(x / 130 + noiseSeed + 950, z / 130 + noiseSeed + 950) * warp1
+		-- Layer 2: medium-scale warp on top of layer 1
+		local warp2 = 35
+		wx = wx + math.noise(wx / 50 + noiseSeed + 960, wz / 50 + noiseSeed + 960) * warp2
+		wz = wz + math.noise(wx / 50 + noiseSeed + 970, wz / 50 + noiseSeed + 970) * warp2
+
+		-- Exponential ramp: gentle at base, steepening further out
+		-- This avoids the linear "wall" look
+		local rampT = math.clamp(distBeyondEdge / mThick, 0, 1)
+		local baseRamp = (rampT ^ 1.8) * 80
+
+		-- Primary mountain shape: large-scale noise as the DOMINANT height driver
+		-- Using warped coordinates so ridgelines aren't parallel to arena edges
+		local n1 = math.noise(wx / 200 + noiseSeed + 500, wz / 200 + noiseSeed + 500)
+		local peak1 = (n1 * 0.5 + 0.5) ^ 0.4 * 160 -- broad peaks, range ~0-160
+
+		-- Ridged noise for sharp ridgelines and valleys
+		local ridge = math.noise(wx / 90 + noiseSeed + 600, wz / 90 + noiseSeed + 600)
+		local ridgeHeight = (1 - math.abs(ridge)) ^ 2 * 70
+
+		-- Medium detail: foothills and spurs
+		local mid = math.noise(wx / 45 + noiseSeed + 700, wz / 45 + noiseSeed + 700) * 30
+
+		-- Fine detail: rocky surface texture (unwarped for variety)
+		local fine = math.noise(x / 18 + noiseSeed + 800, z / 18 + noiseSeed + 800) * 12
+		fine += math.noise(x / 8 + noiseSeed + 850, z / 8 + noiseSeed + 850) * 4
+
+		-- Depth scaling: near the edge, features are smaller; deeper = taller
+		-- Use a curve so features grow quickly at first then plateau
+		local depthScale = math.clamp(distBeyondEdge / 30, 0, 1) ^ 0.7
+
+		-- Combine everything
+		local totalHeight = baseRamp + (peak1 + ridgeHeight + mid + fine) * depthScale
+
+		-- Soft minimum: ensure impassable but blend smoothly instead of hard floor
+		local minHeight = 30 + distBeyondEdge * 0.3
+		if totalHeight < minHeight and distBeyondEdge > 15 then
+			-- Blend toward minimum rather than snapping to it
+			totalHeight = minHeight + (totalHeight - minHeight) * 0.3
+		end
+
+		return math.clamp(totalHeight, 0, 280)
 	end
 
-	-- Invisible border walls
+	-- Material selection for mountain voxels
+	-- Elevation bands: Mud/Ground → Grass → Rock/Slate → Snow/Ice
+	-- Noise offsets the thresholds so transitions are jagged and natural
+	local function selectMountainMaterial(worldY: number, surfaceY: number, worldX: number, worldZ: number): Enum.Material
+		-- Noise to jitter elevation thresholds (±15 studs) so bands aren't flat lines
+		local matNoise = math.noise(worldX / 40 + noiseSeed + 1100, worldZ / 40 + noiseSeed + 1100) * 15
+
+		local effectiveElev = surfaceY + matNoise
+		local isNearSurface = worldY > surfaceY - 3
+
+		if effectiveElev > 200 then
+			-- Snow cap with occasional ice
+			local iceNoise = math.noise(worldX / 20 + noiseSeed + 1200, worldZ / 20 + noiseSeed + 1200)
+			if iceNoise > 0.3 then
+				return Enum.Material.Glacier
+			end
+			return Enum.Material.Snow
+		elseif effectiveElev > 130 then
+			-- Rocky zone: exposed rock on surface, slate underneath
+			if isNearSurface then
+				return Enum.Material.Rock
+			end
+			return Enum.Material.Slate
+		elseif effectiveElev > 60 then
+			-- Grass zone: grass on surface, ground underneath
+			if isNearSurface then
+				return Enum.Material.Grass
+			end
+			return Enum.Material.Ground
+		else
+			-- Low slopes: dirt/mud
+			if isNearSurface then
+				return Enum.Material.Ground
+			end
+			return Enum.Material.Mud
+		end
+	end
+
+	-- WriteVoxels for mountain border terrain
+	local MTN_VOXEL_SIZE = 4
+	local MTN_CHUNK_VOXELS = 16
+	local MTN_CHUNK_SIZE = MTN_CHUNK_VOXELS * MTN_VOXEL_SIZE
+	local MTN_Y_MIN = -8
+	local MTN_Y_MAX = 288
+
+	local mtnChunkCount = 0
+
+	-- Generate border strips: iterate over the full extended region, only process border chunks
+	local extentW = halfW + mThick
+	local extentD = halfD + mThick
+
+	for cx = -extentW, extentW - 1, MTN_CHUNK_SIZE do
+		for cz = -extentD, extentD - 1, MTN_CHUNK_SIZE do
+			-- Skip chunks entirely inside the arena (no mountain terrain)
+			local chunkMaxX = cx + MTN_CHUNK_SIZE
+			local chunkMaxZ = cz + MTN_CHUNK_SIZE
+			if cx > -halfW and chunkMaxX < halfW and cz > -halfD and chunkMaxZ < halfD then
+				continue
+			end
+			-- Skip chunks entirely inside the arena interior (with margin)
+			local margin = 10
+			if cx > -halfW + margin and chunkMaxX < halfW - margin and cz > -halfD + margin and chunkMaxZ < halfD - margin then
+				continue
+			end
+
+			local regionStart = Vector3.new(cx, MTN_Y_MIN, cz)
+			local regionEnd = Vector3.new(cx + MTN_CHUNK_SIZE, MTN_Y_MAX, cz + MTN_CHUNK_SIZE)
+			local region = Region3.new(regionStart, regionEnd):ExpandToGrid(MTN_VOXEL_SIZE)
+
+			local regionSize = region.Size
+			local xVoxels = math.round(regionSize.X / MTN_VOXEL_SIZE)
+			local yVoxels = math.round(regionSize.Y / MTN_VOXEL_SIZE)
+			local zVoxels = math.round(regionSize.Z / MTN_VOXEL_SIZE)
+
+			local materials = {}
+			local occupancy = {}
+
+			for ix = 1, xVoxels do
+				materials[ix] = {}
+				occupancy[ix] = {}
+				local worldX = region.CFrame.Position.X - regionSize.X / 2 + (ix - 0.5) * MTN_VOXEL_SIZE
+
+				for iy = 1, yVoxels do
+					materials[ix][iy] = {}
+					occupancy[ix][iy] = {}
+					local worldY = region.CFrame.Position.Y - regionSize.Y / 2 + (iy - 0.5) * MTN_VOXEL_SIZE
+
+					for iz = 1, zVoxels do
+						local worldZ = region.CFrame.Position.Z - regionSize.Z / 2 + (iz - 0.5) * MTN_VOXEL_SIZE
+						local surfaceY = getMountainHeight(worldX, worldZ)
+
+						if surfaceY <= 0 then
+							occupancy[ix][iy][iz] = 0
+							materials[ix][iy][iz] = Enum.Material.Air
+						else
+							local diff = surfaceY - worldY
+							if diff > MTN_VOXEL_SIZE / 2 then
+								occupancy[ix][iy][iz] = 1.0
+								materials[ix][iy][iz] = selectMountainMaterial(worldY, surfaceY, worldX, worldZ)
+							elseif diff > -MTN_VOXEL_SIZE / 2 then
+								local frac = (diff + MTN_VOXEL_SIZE / 2) / MTN_VOXEL_SIZE
+								occupancy[ix][iy][iz] = math.clamp(frac, 0, 1)
+								materials[ix][iy][iz] = selectMountainMaterial(worldY, surfaceY, worldX, worldZ)
+							else
+								occupancy[ix][iy][iz] = 0
+								materials[ix][iy][iz] = Enum.Material.Air
+							end
+						end
+					end
+				end
+			end
+
+			terrain:WriteVoxels(region, MTN_VOXEL_SIZE, materials, occupancy)
+			mtnChunkCount += 1
+			if mtnChunkCount % 50 == 0 then
+				task.wait()
+			end
+		end
+	end
+	print("[JungleRuins v5] Step 2: Wrote " .. mtnChunkCount .. " mountain chunks")
+
+	-- Invisible border walls (safety net)
+	local wallHeight = 290
 	local borderWalls = {
-		{ CFrame.new(0, mHeight / 2, -halfD), Vector3.new(halfW * 2, mHeight, 5) },
-		{ CFrame.new(0, mHeight / 2, halfD), Vector3.new(halfW * 2, mHeight, 5) },
-		{ CFrame.new(-halfW, mHeight / 2, 0), Vector3.new(5, mHeight, halfD * 2) },
-		{ CFrame.new(halfW, mHeight / 2, 0), Vector3.new(5, mHeight, halfD * 2) },
+		{ CFrame.new(0, wallHeight / 2, -halfD), Vector3.new(halfW * 2, wallHeight, 5) },
+		{ CFrame.new(0, wallHeight / 2, halfD), Vector3.new(halfW * 2, wallHeight, 5) },
+		{ CFrame.new(-halfW, wallHeight / 2, 0), Vector3.new(5, wallHeight, halfD * 2) },
+		{ CFrame.new(halfW, wallHeight / 2, 0), Vector3.new(5, wallHeight, halfD * 2) },
 	}
 	for _, w in borderWalls do
 		local wall = Instance.new("Part")
@@ -2164,102 +2354,221 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 		wall.Parent = arenaFolder
 	end
 
-	-- Trees on mountain slopes (visible from inside)
-	print("[JungleRuins v4] Step 2b: Placing 80 trees on mountain slopes...")
-	for _ = 1, 80 do
+	-- Trees on mountain slopes
+	-- Use getMountainHeight directly (no raycast needed — we know the exact surface)
+	print("[JungleRuins v5] Step 2b: Placing trees on mountain slopes...")
+	local mountainTreesPlaced = 0
+	for _ = 1, 300 do
 		local side = rng:NextInteger(1, 4)
 		local x, z
+		-- Distribute from near the edge into the mountains
+		local depthRaw = rng:NextNumber(0, 1)
+		local depth = depthRaw ^ 0.5 * (mThick - 10) + 3
 		if side == 1 then
-			x = rng:NextNumber(-halfW + 20, halfW - 20)
-			z = -halfD - rng:NextNumber(5, 60)
+			x = rng:NextNumber(-halfW - 30, halfW + 30)
+			z = -halfD - depth
 		elseif side == 2 then
-			x = rng:NextNumber(-halfW + 20, halfW - 20)
-			z = halfD + rng:NextNumber(5, 60)
+			x = rng:NextNumber(-halfW - 30, halfW + 30)
+			z = halfD + depth
 		elseif side == 3 then
-			x = -halfW - rng:NextNumber(5, 60)
-			z = rng:NextNumber(-halfD + 20, halfD - 20)
+			x = -halfW - depth
+			z = rng:NextNumber(-halfD - 30, halfD + 30)
 		else
-			x = halfW + rng:NextNumber(5, 60)
-			z = rng:NextNumber(-halfD + 20, halfD - 20)
+			x = halfW + depth
+			z = rng:NextNumber(-halfD - 30, halfD + 30)
 		end
-		local distFromEdge
-		if side <= 2 then
-			distFromEdge = math.abs(z) - halfD
+
+		-- Get surface height directly from the height function
+		local surfaceY = getMountainHeight(x, z)
+
+		-- Skip above tree line or at ground level
+		if surfaceY > 220 then continue end
+		if surfaceY < 5 then continue end
+
+		-- Check slope by sampling nearby heights
+		local nearbyY = getMountainHeight(x + 8, z)
+		local nearbyZ = getMountainHeight(x, z + 8)
+		local maxSlope = math.max(math.abs(nearbyY - surfaceY), math.abs(nearbyZ - surfaceY))
+		if maxSlope > 25 then continue end -- skip vertical cliffs
+
+		buildTree(Vector3.new(x, surfaceY, z), "mountain")
+		mountainTreesPlaced += 1
+	end
+	print("[JungleRuins v5] Step 2b: Placed " .. mountainTreesPlaced .. " trees on mountain slopes")
+
+	--------------------------------------------------------------------
+	-- 3. ROLLING HILLS (Perlin noise heightmap via WriteVoxels)
+	--------------------------------------------------------------------
+	print("[JungleRuins v5] Step 3: Generating Perlin noise terrain...")
+
+	-- Multi-octave Perlin noise heightmap
+	local function getNoiseHeight(x: number, z: number): number
+		local h = 0
+		-- Octave 1: large rolling hills
+		h += math.noise(x / 200 + noiseSeed, z / 200 + noiseSeed) * 50
+		-- Octave 2: medium undulations
+		h += math.noise(x / 80 + noiseSeed + 100, z / 80 + noiseSeed + 100) * 20
+		-- Octave 3: small terrain detail
+		h += math.noise(x / 30 + noiseSeed + 200, z / 30 + noiseSeed + 200) * 6
+		-- Octave 4: micro bumps
+		h += math.noise(x / 12 + noiseSeed + 300, z / 12 + noiseSeed + 300) * 2
+		-- Ridged noise: occasional sharp ridgelines
+		local ridge = math.noise(x / 120 + noiseSeed + 400, z / 120 + noiseSeed + 400)
+		h += (1 - math.abs(ridge)) ^ 2 * 8
+
+		-- Edge falloff: blend arena terrain into mountain base
+		local edgeFade = 60
+		local distToEdgeX = halfW - math.abs(x)
+		local distToEdgeZ = halfD - math.abs(z)
+		local distToEdge = math.min(distToEdgeX, distToEdgeZ)
+		if distToEdge < edgeFade then
+			local t = math.max(distToEdge / edgeFade, 0)
+			-- Blend arena noise toward mountain base height
+			local mountainBase = getMountainHeight(x, z)
+			h = h * t + mountainBase * (1 - t)
+		end
+
+		return math.clamp(h, -4, 45)
+	end
+
+	-- Material selection by elevation
+	local function selectMaterial(worldY: number, surfaceY: number): Enum.Material
+		if surfaceY > 25 then
+			if worldY > surfaceY - 3 then
+				return Enum.Material.Rock
+			end
+			return Enum.Material.Slate
+		elseif surfaceY < -1 then
+			return Enum.Material.Mud
 		else
-			distFromEdge = math.abs(x) - halfW
+			if worldY > surfaceY - 3 then
+				return Enum.Material.Grass
+			end
+			return Enum.Material.Ground
 		end
-		local slopeY = (distFromEdge / mThick) * mHeight * 0.6
-		buildTree(Vector3.new(x, math.max(slopeY, 0), z), "mountain")
 	end
 
-	--------------------------------------------------------------------
-	-- 3. ROLLING HILLS (dense, varied sizes)
-	--------------------------------------------------------------------
-	print("[JungleRuins v4] Step 3: Generating 340 rolling hills (60 large + 80 medium + 200 small)...")
+	-- WriteVoxels chunk loop (terrain only — water is added in Step 4)
+	local VOXEL_SIZE = 4
+	local CHUNK_VOXELS = 16 -- 16 voxels per chunk axis = 64 studs
+	local CHUNK_SIZE = CHUNK_VOXELS * VOXEL_SIZE
+	local Y_MIN = -8
+	local Y_MAX = 52
 
-	local hillPositions: { Vector3 } = {}
+	local chunkCount = 0
+	for cx = -halfW, halfW - 1, CHUNK_SIZE do
+		for cz = -halfD, halfD - 1, CHUNK_SIZE do
+			local regionStart = Vector3.new(cx, Y_MIN, cz)
+			local regionEnd = Vector3.new(cx + CHUNK_SIZE, Y_MAX, cz + CHUNK_SIZE)
+			local region = Region3.new(regionStart, regionEnd):ExpandToGrid(VOXEL_SIZE)
 
-	-- Large hills
-	for _ = 1, 60 do
-		local x = rng:NextNumber(-halfW * 0.85, halfW * 0.85)
-		local z = rng:NextNumber(-halfD * 0.85, halfD * 0.85)
-		local radius = rng:NextNumber(40, 100)
-		local peakY = rng:NextNumber(12, 45)
-		terrain:FillBall(Vector3.new(x, peakY - radius * 0.5, z), radius, Enum.Material.Grass)
-		table.insert(hillPositions, Vector3.new(x, peakY, z))
+			local regionSize = region.Size
+			local xVoxels = math.round(regionSize.X / VOXEL_SIZE)
+			local yVoxels = math.round(regionSize.Y / VOXEL_SIZE)
+			local zVoxels = math.round(regionSize.Z / VOXEL_SIZE)
+
+			local materials = {}
+			local occupancy = {}
+
+			for ix = 1, xVoxels do
+				materials[ix] = {}
+				occupancy[ix] = {}
+				local worldX = region.CFrame.Position.X - regionSize.X / 2 + (ix - 0.5) * VOXEL_SIZE
+
+				for iy = 1, yVoxels do
+					materials[ix][iy] = {}
+					occupancy[ix][iy] = {}
+					local worldY = region.CFrame.Position.Y - regionSize.Y / 2 + (iy - 0.5) * VOXEL_SIZE
+
+					for iz = 1, zVoxels do
+						local worldZ = region.CFrame.Position.Z - regionSize.Z / 2 + (iz - 0.5) * VOXEL_SIZE
+						local surfaceY = getNoiseHeight(worldX, worldZ)
+
+						local diff = surfaceY - worldY
+						if diff > VOXEL_SIZE / 2 then
+							occupancy[ix][iy][iz] = 1.0
+							materials[ix][iy][iz] = selectMaterial(worldY, surfaceY)
+						elseif diff > -VOXEL_SIZE / 2 then
+							local frac = (diff + VOXEL_SIZE / 2) / VOXEL_SIZE
+							occupancy[ix][iy][iz] = math.clamp(frac, 0, 1)
+							materials[ix][iy][iz] = selectMaterial(worldY, surfaceY)
+						else
+							occupancy[ix][iy][iz] = 0
+							materials[ix][iy][iz] = Enum.Material.Air
+						end
+					end
+				end
+			end
+
+			terrain:WriteVoxels(region, VOXEL_SIZE, materials, occupancy)
+			chunkCount += 1
+			if chunkCount % 50 == 0 then
+				task.wait()
+			end
+		end
 	end
-
-	-- Medium hills
-	for _ = 1, 80 do
-		local x = rng:NextNumber(-halfW * 0.9, halfW * 0.9)
-		local z = rng:NextNumber(-halfD * 0.9, halfD * 0.9)
-		local radius = rng:NextNumber(15, 40)
-		local peakY = rng:NextNumber(4, 18)
-		terrain:FillBall(Vector3.new(x, peakY - radius * 0.55, z), radius, Enum.Material.Grass)
-	end
-
-	-- Small bumps for ground texture
-	for _ = 1, 200 do
-		local x = rng:NextNumber(-halfW * 0.95, halfW * 0.95)
-		local z = rng:NextNumber(-halfD * 0.95, halfD * 0.95)
-		local radius = rng:NextNumber(5, 15)
-		terrain:FillBall(Vector3.new(x, -radius * 0.7, z), radius, Enum.Material.Grass)
-	end
+	print("[JungleRuins v5] Step 3: Wrote " .. chunkCount .. " terrain chunks")
 
 	--------------------------------------------------------------------
-	-- 4. LAKES (visible water pools)
+	-- 4. LAKES (FillCylinder for clean, flat-topped basins)
 	--------------------------------------------------------------------
-	print("[JungleRuins v4] Step 4: Creating lakes (carve + fill)...")
+	print("[JungleRuins v5] Step 4: Creating lakes...")
 
-	local pondPositions: { Vector3 } = {}
-	local pondCount = rng:NextInteger(35, 50)
-	for _ = 1, pondCount do
-		local x = rng:NextNumber(-halfW * 0.75, halfW * 0.75)
-		local z = rng:NextNumber(-halfD * 0.75, halfD * 0.75)
-		local pondRadius = rng:NextNumber(20, 70)
-		local pondDepth = rng:NextNumber(4, 8)
+	local targetLakes = rng:NextInteger(2, 3)
+	local lakeAttempts = 0
+	while #waterRegions < targetLakes and lakeAttempts < targetLakes * 15 do
+		lakeAttempts += 1
+		local lx = rng:NextNumber(-halfW * 0.45, halfW * 0.45)
+		local lz = rng:NextNumber(-halfD * 0.45, halfD * 0.45)
+		local lr = rng:NextNumber(55, 90)
+		local ld = rng:NextNumber(10, 16)
 
-		-- 1. Carve out the grass/terrain with Air to make a visible depression
-		terrain:FillBlock(
-			CFrame.new(x, 0, z),
-			Vector3.new(pondRadius * 2, pondDepth * 2 + 4, pondRadius * 2),
+		local tooClose = false
+		for _, existing in waterRegions do
+			local dx = lx - existing.x
+			local dz = lz - existing.z
+			if math.sqrt(dx * dx + dz * dz) < lr + existing.radius + 80 then
+				tooClose = true
+				break
+			end
+		end
+		if tooClose then continue end
+
+		-- Water level: sample perimeter for the LOWEST surrounding terrain
+		-- Water surface must sit below ALL perimeter points so it never floats
+		local minPerimH = math.huge
+		for angle = 0, 2 * math.pi - 0.01, math.pi / 16 do
+			local px = lx + math.cos(angle) * lr
+			local pz = lz + math.sin(angle) * lr
+			minPerimH = math.min(minPerimH, getNoiseHeight(px, pz))
+		end
+		local waterY = minPerimH - 2
+
+		-- Carve basin (single cylinder — clean round shape)
+		terrain:FillCylinder(
+			CFrame.new(lx, waterY - ld / 2 - 1, lz),
+			ld + 2, lr,
 			Enum.Material.Air
 		)
-		-- 2. Solid mud floor at the bottom so players can't fall through
-		terrain:FillBlock(
-			CFrame.new(x, -pondDepth - 1, z),
-			Vector3.new(pondRadius * 2 + 4, 3, pondRadius * 2 + 4),
+
+		-- Mud floor
+		terrain:FillCylinder(
+			CFrame.new(lx, waterY - ld - 1.5, lz),
+			3, lr + 3,
 			Enum.Material.Mud
 		)
-		-- 3. Fill with water from mud floor up to just below ground level
-		terrain:FillBlock(
-			CFrame.new(x, -pondDepth / 2, z),
-			Vector3.new(pondRadius * 2, pondDepth, pondRadius * 2),
+
+		-- Fill with water
+		terrain:FillCylinder(
+			CFrame.new(lx, waterY - ld / 2, lz),
+			ld, lr,
 			Enum.Material.Water
 		)
 
-		table.insert(pondPositions, Vector3.new(x, 0, z))
+		table.insert(waterRegions, { x = lx, z = lz, radius = lr })
+		print("[JungleRuins v5] Lake at (" .. math.floor(lx) .. ", " .. math.floor(lz) .. ") r=" .. math.floor(lr) .. " waterY=" .. math.floor(waterY))
 	end
+	print("[JungleRuins v5] Step 4: " .. #waterRegions .. " lakes placed")
 
 	-- Let terrain voxels settle so raycasts can find the surface
 	task.wait()
@@ -2267,7 +2576,7 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 	--------------------------------------------------------------------
 	-- 5. ZONE ASSIGNMENT
 	--------------------------------------------------------------------
-	print("[JungleRuins v4] Step 5: Assigning 10x10 zone grid (200 stud zones)...")
+	print("[JungleRuins v5] Step 5: Assigning 10x10 zone grid (200 stud zones)...")
 
 	local zoneTypes: { { string } } = {}
 	for i = 1, ZONE_COUNT do
@@ -2289,12 +2598,12 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 		return result
 	end
 
-	-- elevated_ruins (4-6)
+	-- elevated_ruins → forest (podiums disabled, will be reimplemented later)
 	local elevatedCount = rng:NextInteger(4, 6)
 	local centerZones = { { 4, 4 }, { 4, 5 }, { 5, 4 }, { 5, 5 }, { 4, 6 }, { 5, 6 }, { 6, 4 }, { 6, 5 } }
 	shuffle(centerZones)
-	zoneTypes[centerZones[1][1]][centerZones[1][2]] = "elevated_ruins"
-	zoneTypes[centerZones[2][1]][centerZones[2][2]] = "elevated_ruins"
+	zoneTypes[centerZones[1][1]][centerZones[1][2]] = "forest"
+	zoneTypes[centerZones[2][1]][centerZones[2][2]] = "forest"
 	local remainElevated = elevatedCount - 2
 	if remainElevated > 0 then
 		local cands = getUnassigned()
@@ -2302,7 +2611,7 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 		local placed = 0
 		for _, c in cands do
 			if placed >= remainElevated then break end
-			zoneTypes[c[1]][c[2]] = "elevated_ruins"
+			zoneTypes[c[1]][c[2]] = "forest"
 			placed += 1
 		end
 	end
@@ -2367,72 +2676,6 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 	--------------------------------------------------------------------
 
 	local function generateTempleZone(zi: number, zj: number)
-		local center = zoneCenter(zi, zj)
-
-		local structCount = rng:NextInteger(4, 6)
-		local structPositions: { Vector3 } = {}
-		for _ = 1, structCount do
-			local pos: Vector3
-			local attempts = 0
-			repeat
-				attempts += 1
-				pos = randomInZone(zi, zj, 20)
-			until checkSpacing(pos, structPositions, 30) or attempts > 30
-			table.insert(structPositions, pos)
-			table.insert(coverPositions, pos)
-			local baseAngle = rng:NextNumber(0, 2 * math.pi)
-			local baseCF = CFrame.new(pos) * CFrame.Angles(0, baseAngle, 0)
-			if rng:NextInteger(1, 2) == 1 then
-				buildStoneWall(baseCF)
-				local w2CF = baseCF * CFrame.new(8, 0, 8) * CFrame.Angles(0, math.pi / 2, 0)
-				buildStoneWall(w2CF)
-			else
-				buildStoneWall(baseCF)
-				local w2CF = baseCF * CFrame.new(0, 0, 14)
-				buildStoneWall(w2CF)
-				local w3CF = baseCF * CFrame.new(8, 0, 7) * CFrame.Angles(0, math.pi / 2, 0)
-				buildStoneWall(w3CF)
-			end
-		end
-
-		local pillarCount = rng:NextInteger(4, 8)
-		for _ = 1, pillarCount do
-			local pos = randomInZone(zi, zj, 10)
-			buildPillar(pos)
-			table.insert(coverPositions, pos)
-		end
-
-		for _, adj in getAdjacent(zi, zj) do
-			if zoneTypes[adj[1]][adj[2]] == "elevated_ruins" then
-				local adjCenter = zoneCenter(adj[1], adj[2])
-				local dir = (adjCenter - center).Unit
-				local stairPos = center + dir * (ZONE_SIZE * 0.4)
-				local angle = math.atan2(dir.X, dir.Z)
-				-- Procedural staircase
-				for step = 0, 5 do
-					local stepPart = Instance.new("Part")
-					stepPart.Name = "Stair"
-					stepPart.Size = Vector3.new(8, 2, 4)
-					stepPart.CFrame = CFrame.new(stairPos + Vector3.new(0, step * 2, 0))
-						* CFrame.Angles(0, angle, 0)
-						* CFrame.new(0, 0, step * 3)
-					stepPart.Color = STONE_COLORS[rng:NextInteger(1, #STONE_COLORS)]
-					stepPart.Material = Enum.Material.Slate
-					stepPart.Anchored = true
-					stepPart.CanCollide = true
-					stepPart.Parent = arenaFolder
-				end
-				break
-			end
-		end
-
-		local propCount = rng:NextInteger(5, 10)
-		for _ = 1, propCount do
-			local pos = randomInZone(zi, zj, 8)
-			buildBoulder(pos)
-			table.insert(coverPositions, pos)
-		end
-
 		-- Trees in temple zones (3-5)
 		local treePositions: { Vector3 } = {}
 		for _ = 1, rng:NextInteger(3, 5) do
@@ -2442,6 +2685,18 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 			until checkSpacing(pos, treePositions, 20) or att > 25
 			table.insert(treePositions, pos)
 			buildTree(pos, if rng:NextNumber() < 0.4 then "large" else "small")
+		end
+
+		-- Bush clusters: 6-10
+		for _ = 1, rng:NextInteger(6, 10) do
+			local pos = randomInZone(zi, zj, 4)
+			buildBush(pos)
+		end
+
+		-- Tall grass clusters: 8-14
+		for _ = 1, rng:NextInteger(8, 14) do
+			local pos = randomInZone(zi, zj, 4)
+			buildGrassCluster(pos)
 		end
 	end
 
@@ -2460,13 +2715,6 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 			until checkSpacing(pos, treePositions, 16) or attempts > 50
 			table.insert(treePositions, pos)
 			buildTree(pos, "large")
-
-			if rng:NextNumber() < 0.4 then
-				local vinePos = pos + Vector3.new(rng:NextNumber(-2, 2), 8, rng:NextNumber(-2, 2))
-				local vine = clonePrefab(prefabFolder, "ClimbableVine", vinePos)
-				CollectionService:AddTag(vine, "Climbable")
-				vine.Parent = arenaFolder
-			end
 		end
 
 		-- Small trees: 4-8
@@ -2479,21 +2727,10 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 			buildTree(pos, "small")
 		end
 
-		-- Bush clusters (procedural): 8-14
+		-- Bush clusters: 8-14
 		for _ = 1, rng:NextInteger(8, 14) do
 			local pos = randomInZone(zi, zj, 4)
-			local bush = Instance.new("Part")
-			bush.Name = "Bush"
-			bush.Shape = Enum.PartType.Ball
-			local size = rng:NextNumber(3, 6)
-			bush.Size = Vector3.new(size, size * 0.6, size)
-			bush.Position = pos + Vector3.new(0, size * 0.2, 0)
-			bush.Color = CANOPY_COLORS[rng:NextInteger(1, #CANOPY_COLORS)]
-			bush.Material = Enum.Material.Grass
-			bush.Anchored = true
-			bush.CanCollide = false
-			bush.CastShadow = true
-			bush.Parent = arenaFolder
+			buildBush(pos)
 			table.insert(coverPositions, pos)
 		end
 
@@ -2501,13 +2738,6 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 		for _ = 1, rng:NextInteger(10, 18) do
 			local pos = randomInZone(zi, zj, 4)
 			buildGrassCluster(pos)
-		end
-
-		-- Fireflies: 4-8
-		for _ = 1, rng:NextInteger(4, 8) do
-			local pos = randomInZone(zi, zj, 6) + Vector3.new(0, rng:NextNumber(4, 12), 0)
-			local firefly = clonePrefab(prefabFolder, "Firefly", pos)
-			firefly.Parent = arenaFolder
 		end
 
 		-- Bird sounds
@@ -2527,116 +2757,7 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 	--------------------------------------------------------------------
 
 	local function generateTrapCorridorZone(zi: number, zj: number)
-		local minX, maxX, minZ, maxZ = zoneBounds(zi, zj)
-		local center = zoneCenter(zi, zj)
-		local corridorHalfWidth = 8
-
-		local horizontal = rng:NextInteger(1, 2) == 1
-		local waypoints: { Vector3 } = {}
-		local numMidpoints = rng:NextInteger(3, 5)
-
-		if horizontal then
-			table.insert(waypoints, Vector3.new(minX, 0, center.Z + rng:NextNumber(-20, 20)))
-			for w = 1, numMidpoints do
-				local wx = minX + (maxX - minX) * (w / (numMidpoints + 1))
-				local wz = math.clamp(center.Z + rng:NextNumber(-40, 40), minZ + 15, maxZ - 15)
-				table.insert(waypoints, Vector3.new(wx, 0, wz))
-			end
-			table.insert(waypoints, Vector3.new(maxX, 0, center.Z + rng:NextNumber(-20, 20)))
-		else
-			table.insert(waypoints, Vector3.new(center.X + rng:NextNumber(-20, 20), 0, minZ))
-			for w = 1, numMidpoints do
-				local wz = minZ + (maxZ - minZ) * (w / (numMidpoints + 1))
-				local wx = math.clamp(center.X + rng:NextNumber(-40, 40), minX + 15, maxX - 15)
-				table.insert(waypoints, Vector3.new(wx, 0, wz))
-			end
-			table.insert(waypoints, Vector3.new(center.X + rng:NextNumber(-20, 20), 0, maxZ))
-		end
-
-		local totalLength = 0
-		for idx = 1, #waypoints - 1 do
-			totalLength += (waypoints[idx + 1] - waypoints[idx]).Magnitude
-		end
-
-		local function posAlongPath(t: number): (Vector3, Vector3)
-			local targetDist = math.clamp(t, 0, 1) * totalLength
-			local accumulated = 0
-			for idx = 1, #waypoints - 1 do
-				local seg = waypoints[idx + 1] - waypoints[idx]
-				local segLen = seg.Magnitude
-				if accumulated + segLen >= targetDist then
-					local segT = (targetDist - accumulated) / math.max(segLen, 0.01)
-					local pos = waypoints[idx]:Lerp(waypoints[idx + 1], segT)
-					local dir = segLen > 0.01 and seg.Unit or Vector3.new(1, 0, 0)
-					return pos, dir
-				end
-				accumulated += segLen
-			end
-			local lastSeg = waypoints[#waypoints] - waypoints[#waypoints - 1]
-			local dir = lastSeg.Magnitude > 0.01 and lastSeg.Unit or Vector3.new(1, 0, 0)
-			return waypoints[#waypoints], dir
-		end
-
-		local gridSize = arenaData.gridSize
-		for segIdx = 1, #waypoints - 1 do
-			local from = waypoints[segIdx]
-			local to = waypoints[segIdx + 1]
-			local seg = to - from
-			local segLen = seg.Magnitude
-			local dir = segLen > 0.01 and seg.Unit or Vector3.new(1, 0, 0)
-			local perp = Vector3.new(-dir.Z, 0, dir.X)
-			local wallAngle = math.atan2(dir.X, dir.Z)
-			local steps = math.ceil(segLen / gridSize)
-			for step = 0, steps do
-				local t = steps > 0 and (step / steps) or 0
-				local pos = from + seg * t
-				local leftWall = cloneWithCFrame("StoneWall",
-					CFrame.new(pos + perp * (corridorHalfWidth + 2)) * CFrame.Angles(0, wallAngle, 0))
-				leftWall.Parent = arenaFolder
-				local rightWall = cloneWithCFrame("StoneWall",
-					CFrame.new(pos - perp * (corridorHalfWidth + 2)) * CFrame.Angles(0, wallAngle, 0))
-				rightWall.Parent = arenaFolder
-			end
-		end
-
-		for d = 1, rng:NextInteger(3, 5) do
-			local t = d / (rng:NextInteger(3, 5) + 2) + rng:NextNumber(-0.04, 0.04)
-			local pos, pathDir = posAlongPath(t)
-			local perp = Vector3.new(-pathDir.Z, 0, pathDir.X)
-			local side = rng:NextInteger(1, 2) == 1 and 1 or -1
-			local dartPos = pos + perp * (corridorHalfWidth * 0.8 * side) + Vector3.new(0, 3, 0)
-			local dartAngle = math.atan2(-perp.X * side, -perp.Z * side)
-			local dart = cloneWithCFrame("DartTrap",
-				CFrame.new(dartPos) * CFrame.Angles(0, dartAngle, 0))
-			CollectionService:AddTag(dart, "DartTrap")
-			dart.Parent = arenaFolder
-			local plate = clonePrefab(prefabFolder, "PressurePlate", pos + Vector3.new(0, 0.25, 0))
-			CollectionService:AddTag(plate, "TrapTrigger_Dart")
-			local link = Instance.new("ObjectValue")
-			link.Name = "LinkedDartTrap"
-			link.Value = dart
-			link.Parent = plate
-			plate.Parent = arenaFolder
-		end
-
-		for s = 1, rng:NextInteger(2, 3) do
-			local t = 0.2 + (s - 1) * 0.3 + rng:NextNumber(-0.04, 0.04)
-			local pos, pathDir = posAlongPath(t)
-			local perp = Vector3.new(-pathDir.Z, 0, pathDir.X)
-			local logAngle = math.atan2(perp.X, perp.Z)
-			local log = cloneWithCFrame("SwingLog",
-				CFrame.new(pos + Vector3.new(0, 5, 0)) * CFrame.Angles(0, logAngle, 0))
-			CollectionService:AddTag(log, "SwingLogTrap")
-			log.Parent = arenaFolder
-		end
-
-		local pitPos = posAlongPath(rng:NextNumber(0.35, 0.65))
-		local pit = clonePrefab(prefabFolder, "PitTrap", pitPos)
-		CollectionService:AddTag(pit, "PitTrap")
-		if pit:IsA("BasePart") then pit:SetAttribute("PitDepth", 10) end
-		pit.Parent = arenaFolder
-
-		-- Trees flanking corridor (3-5)
+		-- Trees (3-5)
 		local treePositions: { Vector3 } = {}
 		for _ = 1, rng:NextInteger(3, 5) do
 			local pos: Vector3
@@ -2646,6 +2767,18 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 			table.insert(treePositions, pos)
 			buildTree(pos, if rng:NextNumber() < 0.5 then "large" else "small")
 		end
+
+		-- Bush clusters: 6-10
+		for _ = 1, rng:NextInteger(6, 10) do
+			local pos = randomInZone(zi, zj, 4)
+			buildBush(pos)
+		end
+
+		-- Tall grass clusters: 8-14
+		for _ = 1, rng:NextInteger(8, 14) do
+			local pos = randomInZone(zi, zj, 4)
+			buildGrassCluster(pos)
+		end
 	end
 
 	--------------------------------------------------------------------
@@ -2653,17 +2786,6 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 	--------------------------------------------------------------------
 
 	local function generateCourtyardZone(zi: number, zj: number)
-		for _ = 1, rng:NextInteger(2, 4) do
-			local pos = randomInZone(zi, zj, 15)
-			buildPillar(pos)
-		end
-
-		for _ = 1, rng:NextInteger(4, 7) do
-			local pos = randomInZone(zi, zj, 10)
-			buildBoulder(pos)
-			table.insert(coverPositions, pos)
-		end
-
 		-- Dense ring of trees (4-6)
 		local treePositions: { Vector3 } = {}
 		for _ = 1, rng:NextInteger(4, 6) do
@@ -2678,6 +2800,18 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 				buildTree(pos, "large")
 			end
 		end
+
+		-- Bush clusters: 6-10
+		for _ = 1, rng:NextInteger(6, 10) do
+			local pos = randomInZone(zi, zj, 4)
+			buildBush(pos)
+		end
+
+		-- Tall grass clusters: 8-14
+		for _ = 1, rng:NextInteger(8, 14) do
+			local pos = randomInZone(zi, zj, 4)
+			buildGrassCluster(pos)
+		end
 	end
 
 	--------------------------------------------------------------------
@@ -2685,86 +2819,8 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 	--------------------------------------------------------------------
 
 	local function generateElevatedRuinsZone(zi: number, zj: number)
-		local center = zoneCenter(zi, zj)
-		local minX, maxX, minZ, maxZ = zoneBounds(zi, zj)
-
-		terrain:FillBlock(
-			CFrame.new(center.X, ELEVATED_Y / 2, center.Z),
-			Vector3.new(ZONE_SIZE * 0.85, ELEVATED_Y, ZONE_SIZE * 0.85),
-			Enum.Material.Ground
-		)
-		terrain:FillBlock(
-			CFrame.new(center.X, ELEVATED_Y, center.Z),
-			Vector3.new(ZONE_SIZE * 0.85, 4, ZONE_SIZE * 0.85),
-			Enum.Material.Grass
-		)
-
-		local basePos = center + Vector3.new(0, ELEVATED_Y + 1, 0)
-		local base = clonePrefab(prefabFolder, "TempleBase", basePos)
-		base.Parent = arenaFolder
-
-		for _ = 1, rng:NextInteger(3, 5) do
-			local pos = Vector3.new(
-				rng:NextNumber(minX + 20, maxX - 20), ELEVATED_Y + 1,
-				rng:NextNumber(minZ + 20, maxZ - 20))
-			local angle = rng:NextNumber(0, 2 * math.pi)
-			local wall = cloneWithCFrame("StoneWall",
-				CFrame.new(pos) * CFrame.Angles(0, angle, 0))
-			wall.Parent = arenaFolder
-			table.insert(coverPositions, pos)
-		end
-
-		for _ = 1, rng:NextInteger(4, 6) do
-			local pos = Vector3.new(
-				rng:NextNumber(minX + 15, maxX - 15), ELEVATED_Y + 1,
-				rng:NextNumber(minZ + 15, maxZ - 15))
-			local pillar = cloneRandomVariant(prefabFolder, "RuinedPillar", pos)
-			pillar.Parent = arenaFolder
-		end
-
-		local sides = {
-			{ dir = Vector3.new(-1, 0, 0), angle = math.pi / 2 },
-			{ dir = Vector3.new(1, 0, 0), angle = -math.pi / 2 },
-			{ dir = Vector3.new(0, 0, -1), angle = 0 },
-			{ dir = Vector3.new(0, 0, 1), angle = math.pi },
-		}
-		shuffle(sides)
-		for idx = 1, math.min(rng:NextInteger(2, 3), #sides) do
-			local side = sides[idx]
-			local edgePos = center + side.dir * (ZONE_SIZE * 0.4)
-			if rng:NextNumber() < 0.6 then
-				local stair = cloneWithCFrame("StoneStaircase",
-					CFrame.new(edgePos) * CFrame.Angles(0, side.angle, 0))
-				stair.Parent = arenaFolder
-			else
-				local vinePos = edgePos + Vector3.new(0, ELEVATED_Y * 0.5, 0)
-				local vine = clonePrefab(prefabFolder, "ClimbableVine", vinePos)
-				CollectionService:AddTag(vine, "Climbable")
-				vine.Parent = arenaFolder
-			end
-		end
-
-		-- Trees on elevated platform (2-3)
-		local treePositions: { Vector3 } = {}
-		for _ = 1, rng:NextInteger(2, 3) do
-			local pos = Vector3.new(
-				rng:NextNumber(minX + 15, maxX - 15), ELEVATED_Y + 1,
-				rng:NextNumber(minZ + 15, maxZ - 15))
-			if checkSpacing(pos, treePositions, 18) then
-				table.insert(treePositions, pos)
-				buildTree(pos, if rng:NextNumber() < 0.3 then "large" else "small")
-			end
-		end
-
-		local soundPart = Instance.new("Part")
-		soundPart.Name = "AmbientSound_Wind"
-		soundPart.Size = Vector3.new(1, 1, 1)
-		soundPart.Position = center + Vector3.new(0, ELEVATED_Y + 8, 0)
-		soundPart.Anchored = true
-		soundPart.CanCollide = false
-		soundPart.Transparency = 1
-		CollectionService:AddTag(soundPart, "AmbientSound_Wind")
-		soundPart.Parent = arenaFolder
+		-- Elevated ruins zone now just generates as forest (no elevated terrain)
+		generateForestZone(zi, zj)
 	end
 
 	--------------------------------------------------------------------
@@ -2788,58 +2844,6 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 		end
 	end
 
-	--------------------------------------------------------------------
-	-- ROPE BRIDGES between elevated zones
-	--------------------------------------------------------------------
-
-	local elevatedZones: { { number } } = {}
-	for zi = 1, ZONE_COUNT do
-		for zj = 1, ZONE_COUNT do
-			if zoneTypes[zi][zj] == "elevated_ruins" then
-				table.insert(elevatedZones, { zi, zj })
-			end
-		end
-	end
-
-	for a = 1, #elevatedZones do
-		for b = a + 1, #elevatedZones do
-			local cA = zoneCenter(elevatedZones[a][1], elevatedZones[a][2])
-			local cB = zoneCenter(elevatedZones[b][1], elevatedZones[b][2])
-			local dist = (cA - cB).Magnitude
-			if dist <= ZONE_SIZE * 2.5 then
-				local midpoint = (cA + cB) / 2
-				midpoint = Vector3.new(midpoint.X, ELEVATED_Y + 1, midpoint.Z)
-				local bridgeDir = cB - cA
-				local bridgeAngle = math.atan2(bridgeDir.X, bridgeDir.Z)
-				local bridge = cloneWithCFrame("RopeBridge",
-					CFrame.new(midpoint) * CFrame.Angles(0, bridgeAngle, 0))
-				bridge.Parent = arenaFolder
-			end
-		end
-	end
-
-	--------------------------------------------------------------------
-	-- TRANSITION RUBBLE
-	--------------------------------------------------------------------
-
-	for zi = 1, ZONE_COUNT do
-		for zj = 1, ZONE_COUNT do
-			if zoneTypes[zi][zj] == "forest" then
-				for _, adj in getAdjacent(zi, zj) do
-					local adjType = zoneTypes[adj[1]][adj[2]]
-					if adjType == "temple" or adjType == "elevated_ruins" then
-						local borderCenter = (zoneCenter(zi, zj) + zoneCenter(adj[1], adj[2])) / 2
-						for _ = 1, rng:NextInteger(3, 6) do
-							local rubblePos = borderCenter + Vector3.new(
-								rng:NextNumber(-15, 15), 0, rng:NextNumber(-15, 15))
-							local rubble = cloneRandomVariant(prefabFolder, "StoneBoulder", rubblePos)
-							rubble.Parent = arenaFolder
-						end
-					end
-				end
-			end
-		end
-	end
 
 	--------------------------------------------------------------------
 	-- SPAWN POINTS
@@ -2874,56 +2878,77 @@ local function generateJungleRuins(arenaFolder: Folder, arenaData: ArenaData, pr
 		end
 	end
 
+	-- Wait for terrain to settle so raycasts reflect final terrain state
+	task.wait()
+
 	local maxAttempts = spawnCount * 80
 	local attempts = 0
 	while #spawnPositions < spawnCount and attempts < maxAttempts do
 		attempts += 1
 		local zone = spawnableZones[rng:NextInteger(1, #spawnableZones)]
 		local zt = zoneTypes[zone[1]][zone[2]]
-		local y = 1
-		if zt == "elevated_ruins" then y = ELEVATED_Y + 2 end
-		local candidate = randomInZone(zone[1], zone[2], 15) + Vector3.new(0, y, 0)
+
+		local minX2, maxX2, minZ2, maxZ2 = zoneBounds(zone[1], zone[2])
+		local sx = rng:NextNumber(minX2 + 15, maxX2 - 15)
+		local sz = rng:NextNumber(minZ2 + 15, maxZ2 - 15)
+		-- Raycast now to get the final terrain surface (after all carving/banking)
+		local sy = getTerrainHeight(sx, sz)
+		if zt == "elevated_ruins" then sy = ELEVATED_Y + 2 end
+
+		-- Skip spawns that landed in water regions
+		local inWater = false
+		for _, wr in waterRegions do
+			local dx = sx - wr.x
+			local dz = sz - wr.z
+			if dx * dx + dz * dz < wr.radius * wr.radius then
+				inWater = true
+				break
+			end
+		end
+		if inWater then continue end
+
+		local candidate = Vector3.new(sx, sy + 1, sz)
 		if checkSpacing(candidate, spawnPositions, minSpawnDist) then
 			table.insert(spawnPositions, candidate)
 		end
 	end
 
-	local coveredCount = 0
-	for _, sp in spawnPositions do
-		for _, cv in coverPositions do
-			local dx = sp.X - cv.X
-			local dz = sp.Z - cv.Z
-			if math.sqrt(dx * dx + dz * dz) <= 12 then
-				coveredCount += 1
-				break
-			end
-		end
-	end
-	if coveredCount < 5 then
-		for _, sp in spawnPositions do
-			if coveredCount >= 5 then break end
-			local hasCover = false
-			for _, cv in coverPositions do
-				local dx = sp.X - cv.X
-				local dz = sp.Z - cv.Z
-				if math.sqrt(dx * dx + dz * dz) <= 12 then
-					hasCover = true
-					break
-				end
-			end
-			if not hasCover then
-				local boulderPos = Vector3.new(sp.X, 0, sp.Z)
-					+ Vector3.new(rng:NextNumber(-6, 6), 0, rng:NextNumber(-6, 6))
-				local boulder = cloneRandomVariant(prefabFolder, "StoneBoulder", boulderPos)
-				boulder.Parent = arenaFolder
-				table.insert(coverPositions, boulderPos)
-				coveredCount += 1
-			end
-		end
-	end
-
 	placeSpawnPoints(spawnPositions, arenaFolder)
-	print("[JungleRuins v4] === JUNGLE RUINS GENERATION COMPLETE ===")
+
+	AmbientWildlife.start(arenaFolder, zoneTypes, zoneBounds, getTerrainHeight, rng)
+
+	-- Spatial water sounds at each lake center
+	-- NOTE: Replace WATER_SOUND_ID and FOREST_SOUND_ID at the top of this file
+	-- with asset IDs you upload via Roblox Studio Asset Manager
+	for _, wr in waterRegions do
+		if WATER_SOUND_ID ~= "" then
+			local soundPart = Instance.new("Part")
+			soundPart.Name = "WaterSoundEmitter"
+			soundPart.Size = Vector3.new(1, 1, 1)
+			soundPart.Anchored = true
+			soundPart.CanCollide = false
+			soundPart.CanTouch = false
+			soundPart.CanQuery = false
+			soundPart.Transparency = 1
+			soundPart.Position = Vector3.new(wr.x, getTerrainHeight(wr.x, wr.z), wr.z)
+
+			local sound = Instance.new("Sound")
+			sound.Name = "WaterAmbient"
+			sound.SoundId = WATER_SOUND_ID
+			sound.Volume = 0.5
+			sound.Looped = true
+			sound.RollOffMode = Enum.RollOffMode.InverseTapered
+			sound.RollOffMinDistance = 30
+			sound.RollOffMaxDistance = 150
+			sound.Parent = soundPart
+			sound:Play()
+
+			soundPart.Parent = arenaFolder
+		end
+	end
+	print("[JungleRuins v5] Placed " .. #waterRegions .. " lake sound emitters")
+
+	print("[JungleRuins v5] === JUNGLE RUINS GENERATION COMPLETE ===")
 end
 
 ------------------------------------------------------------------------
@@ -2943,12 +2968,41 @@ local layoutGenerators: { [string]: (Folder, ArenaData, Folder?) -> () } = {
 
 --- Remove the current arena from Workspace and reset lighting.
 function ArenaGenerator.clearArena()
+	AmbientWildlife.stop()
+
 	local existing = Workspace:FindFirstChild(ARENA_FOLDER_NAME)
 	if existing then
 		existing:Destroy()
 	end
 	-- Clear procedural terrain (hills, mountains, ponds)
 	Workspace.Terrain:Clear()
+
+	-- Disconnect Jungle Ruins sun animation if active
+	if jungleSunConnection then
+		jungleSunConnection:Disconnect()
+		jungleSunConnection = nil
+	end
+
+	-- Remove Jungle Ruins global ambient sound
+	local forestSound = Workspace:FindFirstChild("JungleRuins_ForestAmbient")
+	if forestSound then
+		forestSound:Destroy()
+	end
+
+	-- Remove all Jungle Ruins lighting objects (Atmosphere, SunRays, Bloom, ColorCorrection)
+	for _, child in Lighting:GetChildren() do
+		if child.Name:sub(1, 12) == "JungleRuins_" then
+			child:Destroy()
+		end
+	end
+
+	-- Reset extended lighting properties to defaults
+	Lighting.GlobalShadows = true
+	Lighting.ShadowSoftness = 0.2
+	Lighting.EnvironmentDiffuseScale = 0
+	Lighting.EnvironmentSpecularScale = 0
+	Lighting.GeographicLatitude = 41.733
+
 	resetLighting()
 end
 
@@ -3026,6 +3080,140 @@ function ArenaGenerator.generate(arenaType: string, seed: number?): GenerationRe
 
 	-- Apply lighting
 	applyLighting(arenaData.lightingConfig)
+
+	-- Jungle Ruins: add atmospheric effects (atmosphere, post-processing, fog)
+	if arenaType == "JungleRuins" then
+		-- Keep the moody twilight ClockTime from lightingConfig (6.5)
+		Lighting.GlobalShadows = true
+		Lighting.ShadowSoftness = 0.15
+		Lighting.EnvironmentDiffuseScale = 0.5
+		Lighting.EnvironmentSpecularScale = 0.3
+		Lighting.GeographicLatitude = 20
+
+		-- Atmosphere — mysterious fog and aerial perspective
+		local atmoConfig = arenaData.atmosphereConfig
+		local atmosphere = Instance.new("Atmosphere")
+		atmosphere.Name = "JungleRuins_Atmosphere"
+		if atmoConfig then
+			atmosphere.Density = atmoConfig.Density
+			atmosphere.Offset = atmoConfig.Offset
+			atmosphere.Color = atmoConfig.Color
+			atmosphere.Decay = atmoConfig.Decay
+			atmosphere.Glare = atmoConfig.Glare
+			atmosphere.Haze = atmoConfig.Haze
+		else
+			atmosphere.Density = 0.3
+			atmosphere.Offset = 0.25
+			atmosphere.Color = Color3.fromRGB(160, 190, 140)
+			atmosphere.Decay = Color3.fromRGB(120, 140, 100)
+			atmosphere.Glare = 0.4
+			atmosphere.Haze = 1.5
+		end
+		atmosphere.Parent = Lighting
+
+		-- SunRays — god rays breaking through tree canopy
+		local sunRays = Instance.new("SunRaysEffect")
+		sunRays.Name = "JungleRuins_SunRays"
+		sunRays.Intensity = 0.08
+		sunRays.Spread = 0.6
+		sunRays.Parent = Lighting
+
+		-- Bloom — soft warm glow on highlights
+		local bloom = Instance.new("BloomEffect")
+		bloom.Name = "JungleRuins_Bloom"
+		bloom.Intensity = 0.3
+		bloom.Size = 30
+		bloom.Threshold = 1.5
+		bloom.Parent = Lighting
+
+		-- ColorCorrection — warm jungle tint
+		local colorCorrection = Instance.new("ColorCorrectionEffect")
+		colorCorrection.Name = "JungleRuins_ColorCorrection"
+		colorCorrection.Brightness = 0.02
+		colorCorrection.Contrast = 0.08
+		colorCorrection.Saturation = 0.15
+		colorCorrection.TintColor = Color3.fromRGB(255, 248, 235)
+		colorCorrection.Parent = Lighting
+
+		-- Animate ClockTime: slow drift within twilight range (6.5 → 7.5)
+		-- Keeps the moody atmosphere while adding subtle sky movement
+		jungleSunConnection = RunService.Heartbeat:Connect(function(dt: number)
+			local current = Lighting.ClockTime
+			if current < 7.5 then
+				Lighting.ClockTime = math.min(current + dt * 0.003, 7.5)
+			end
+		end)
+
+		-- Ground fog emitter patches scattered across the arena floor
+		local fogConfig = arenaData.groundFogConfig
+		if fogConfig then
+			local boundsW = arenaData.bounds.width or arenaData.bounds.diameter or 200
+			local boundsD = arenaData.bounds.depth or arenaData.bounds.diameter or 200
+			local halfW = boundsW / 2
+			local halfD = boundsD / 2
+			-- Keep fog within 80% of the arena to avoid edges
+			local spreadW = halfW * 0.8
+			local spreadD = halfD * 0.8
+
+			local fogFolder = Instance.new("Folder")
+			fogFolder.Name = "JungleRuins_GroundFog"
+
+			for i = 1, fogConfig.emitterCount do
+				local fogPart = Instance.new("Part")
+				fogPart.Name = "FogEmitter_" .. i
+				fogPart.Size = fogConfig.patchSize
+				fogPart.Anchored = true
+				fogPart.CanCollide = false
+				fogPart.CanTouch = false
+				fogPart.CanQuery = false
+				fogPart.Transparency = 1
+				-- Position at actual terrain height using raycast
+				local fx = math.random() * spreadW * 2 - spreadW
+				local fz = math.random() * spreadD * 2 - spreadD
+				local fogRay = Workspace:Raycast(Vector3.new(fx, 500, fz), Vector3.new(0, -1000, 0))
+				local fy = if fogRay then fogRay.Position.Y + 2 else 2
+				fogPart.Position = Vector3.new(fx, fy, fz)
+
+				local emitter = Instance.new("ParticleEmitter")
+				emitter.Name = "FogParticles"
+				emitter.Texture = fogConfig.particleTexture
+				emitter.Color = ColorSequence.new(fogConfig.particleColor)
+				emitter.Size = fogConfig.particleSize
+				emitter.Transparency = fogConfig.particleTransparency
+				emitter.Lifetime = fogConfig.particleLifetime
+				emitter.Rate = fogConfig.particleRate
+				emitter.Speed = fogConfig.particleSpeed
+				emitter.SpreadAngle = fogConfig.particleSpread
+				emitter.RotSpeed = NumberRange.new(-15, 15)
+				emitter.Rotation = NumberRange.new(0, 360)
+				emitter.EmissionDirection = Enum.NormalId.Top
+				emitter.LightEmission = 0.35
+				emitter.LightInfluence = 0.6
+				emitter.Drag = 0.5
+				emitter.VelocityInheritance = 0
+				emitter.LockedToPart = false
+				emitter.Parent = fogPart
+
+				fogPart.Parent = fogFolder
+			end
+
+			fogFolder.Parent = arenaFolder
+			print("[ArenaGenerator] Placed " .. fogConfig.emitterCount .. " ground fog emitters for Jungle Ruins")
+		end
+
+		-- Global forest ambient sound (birds, insects, wind)
+		if FOREST_SOUND_ID ~= "" then
+			local forestAmbient = Instance.new("Sound")
+			forestAmbient.Name = "JungleRuins_ForestAmbient"
+			forestAmbient.SoundId = FOREST_SOUND_ID
+			forestAmbient.Volume = 0.3
+			forestAmbient.Looped = true
+			forestAmbient.PlayOnRemove = false
+			forestAmbient.Parent = Workspace
+			forestAmbient:Play()
+			print("[ArenaGenerator] Started global forest ambient sound for Jungle Ruins")
+		end
+	end
 
 	-- Parent the arena folder last (Roblox best practice)
 	arenaFolder.Parent = Workspace

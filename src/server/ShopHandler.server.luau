@@ -302,6 +302,10 @@ local function handlePurchase(player: Player, itemId: string): (boolean, string,
 		local weaponName = item.weaponName :: string
 		local tier = item.tier :: number
 		inv.weaponTiers[weaponName] = tier
+		-- Swap the visual Tool model if this is the equipped weapon
+		if inv.equippedWeapon == weaponName then
+			equipWeaponEvent:Fire(player, weaponName)
+		end
 	elseif item.category == "Skins" then
 		inv.ownedSkins[itemId] = true
 	elseif item.category == "Emotes" then

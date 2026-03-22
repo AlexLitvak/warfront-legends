@@ -40,11 +40,13 @@ local markCleanupThread: thread? = nil
 ------------------------------------------------------------------------
 
 local SWING_ANIM_IDS: { [string]: string } = {
-	Sword = "",   -- placeholder
+	Sword = "rbxassetid://522635514",
 	Axe = "",     -- placeholder
 	Bow = "",     -- placeholder
 	Scythe = "",  -- placeholder
 }
+
+local LUNGE_ANIM_ID = "rbxassetid://522638767"
 
 local function getAnimator(): Animator?
 	local character = player.Character
@@ -77,6 +79,33 @@ local function playAttackAnimation()
 	track:Play()
 
 	anim:Destroy()
+end
+
+------------------------------------------------------------------------
+-- Tool sounds
+------------------------------------------------------------------------
+
+local function getToolHandle(): BasePart?
+	local character = player.Character
+	if not character then
+		return nil
+	end
+	local tool = character:FindFirstChildOfClass("Tool")
+	if not tool then
+		return nil
+	end
+	return tool:FindFirstChild("Handle") :: BasePart?
+end
+
+local function playToolSound(soundName: string)
+	local handle = getToolHandle()
+	if not handle then
+		return
+	end
+	local sound = handle:FindFirstChild(soundName) :: Sound?
+	if sound then
+		sound:Play()
+	end
 end
 
 ------------------------------------------------------------------------
@@ -126,6 +155,7 @@ local function tryAttack()
 	isAttacking = true
 
 	playAttackAnimation()
+	playToolSound("SwordSlash")
 
 	-- Build attack data based on weapon type
 	local attackData: { [string]: any } = {
@@ -161,6 +191,7 @@ local function tryEarthshaker()
 	end
 
 	playAttackAnimation()
+	playToolSound("SwordLunge")
 
 	Remotes.AttackInput:FireServer({
 		weapon = equippedWeapon,
@@ -329,6 +360,81 @@ Remotes.PerkEffect.OnClientEvent:Connect(function(data: { [string]: any })
 		-- Headshot hit — could play a special hit marker sound
 	end
 end)
+
+------------------------------------------------------------------------
+-- Tool activation (weapon Tool in character triggers this on click)
+------------------------------------------------------------------------
+
+local function connectToolActivated(tool: Tool)
+	tool.Activated:Connect(function()
+		if equippedWeapon == "Axe" and not isCharging then
+			isCharging = true
+			chargeStartTime = os.clock()
+		end
+		tryAttack()
+	end)
+
+	tool.Deactivated:Connect(function()
+		if isCharging and equippedWeapon == "Axe" then
+			local chargeTime = os.clock() - chargeStartTime
+			local perk = WeaponConfig.Axe.perk
+			local requiredCharge = if perk then (perk.chargeTime or 1.5) else 1.5
+
+			if chargeTime >= requiredCharge then
+				tryEarthshaker()
+			end
+
+			isCharging = false
+			chargeStartTime = 0
+		end
+	end)
+
+	tool.Equipped:Connect(function()
+		local handle = tool:FindFirstChild("Handle") :: BasePart?
+		if handle then
+			local unsheath = handle:FindFirstChild("Unsheath") :: Sound?
+			if unsheath then
+				unsheath:Play()
+			end
+		end
+	end)
+end
+
+local function onCharacterAdded(character: Model)
+	-- Connect to any Tool already in the character
+	for _, child in character:GetChildren() do
+		if child:IsA("Tool") then
+			connectToolActivated(child)
+		end
+	end
+
+	-- Connect to Tools added later (e.g. weapon swap)
+	character.ChildAdded:Connect(function(child: Instance)
+		if child:IsA("Tool") then
+			connectToolActivated(child :: Tool)
+		end
+	end)
+
+	-- Also check Backpack for Tools that get equipped into character
+	local backpack = player:WaitForChild("Backpack", 5)
+	if backpack then
+		for _, child in backpack:GetChildren() do
+			if child:IsA("Tool") then
+				connectToolActivated(child)
+			end
+		end
+		backpack.ChildAdded:Connect(function(child: Instance)
+			if child:IsA("Tool") then
+				connectToolActivated(child :: Tool)
+			end
+		end)
+	end
+end
+
+player.CharacterAdded:Connect(onCharacterAdded)
+if player.Character then
+	onCharacterAdded(player.Character)
+end
 
 ------------------------------------------------------------------------
 -- Weapon equip handling (from ShopHandler via server)

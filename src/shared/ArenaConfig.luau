@@ -45,6 +45,28 @@ export type ArenaBounds = {
 	depth: number?,         -- for rectangular arenas
 }
 
+export type AtmosphereConfig = {
+	Density: number,
+	Offset: number,
+	Color: Color3,
+	Decay: Color3,
+	Glare: number,
+	Haze: number,
+}
+
+export type GroundFogConfig = {
+	emitterCount: number,      -- number of fog emitter parts to scatter
+	patchSize: Vector3,        -- size of each invisible emitter part
+	particleLifetime: NumberRange,
+	particleSize: NumberSequence,
+	particleTransparency: NumberSequence,
+	particleColor: Color3,
+	particleRate: number,
+	particleSpeed: NumberRange,
+	particleSpread: Vector2,   -- X = horizontal angle, Y = vertical angle
+	particleTexture: string,   -- rbxassetid for a soft cloud/smoke texture
+}
+
 export type ArenaData = {
 	name: string,
 	displayName: string,
@@ -54,6 +76,8 @@ export type ArenaData = {
 	minSpawnDistance: number,
 	spawnCount: number,
 	lightingConfig: LightingConfig,
+	atmosphereConfig: AtmosphereConfig?,
+	groundFogConfig: GroundFogConfig?,
 	hazards: { HazardConfig },
 	environmentalEvents: { EnvironmentalEvent },
 	music: string,
@@ -203,12 +227,41 @@ local Arenas: { [string]: ArenaData } = {
 		minSpawnDistance = 50,
 		spawnCount = 20,
 		lightingConfig = {
-			Brightness = 1.5,
-			Ambient = Color3.fromRGB(60, 100, 60),
-			OutdoorAmbient = Color3.fromRGB(100, 140, 80),
-			FogEnd = 600,
-			FogColor = Color3.fromRGB(80, 120, 70),
-			ClockTime = 11,
+			Brightness = 0.8,
+			Ambient = Color3.fromRGB(30, 30, 45),
+			OutdoorAmbient = Color3.fromRGB(60, 50, 40),
+			FogEnd = 500,
+			FogColor = Color3.fromRGB(50, 45, 55),
+			ClockTime = 6.5,
+		},
+		atmosphereConfig = {
+			Density = 0.45,
+			Offset = 0.1,
+			Color = Color3.fromRGB(120, 140, 130),
+			Decay = Color3.fromRGB(80, 100, 90),
+			Glare = 0.15,
+			Haze = 3.5,
+		},
+		groundFogConfig = {
+			emitterCount = 35,
+			patchSize = Vector3.new(60, 1, 60),
+			particleLifetime = NumberRange.new(8, 16),
+			particleSize = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 25),
+				NumberSequenceKeypoint.new(0.5, 55),
+				NumberSequenceKeypoint.new(1, 30),
+			}),
+			particleTransparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 1),
+				NumberSequenceKeypoint.new(0.15, 0.5),
+				NumberSequenceKeypoint.new(0.8, 0.55),
+				NumberSequenceKeypoint.new(1, 1),
+			}),
+			particleColor = Color3.fromRGB(180, 185, 175),
+			particleRate = 5,
+			particleSpeed = NumberRange.new(0.3, 1.5),
+			particleSpread = Vector2.new(180, 8),
+			particleTexture = "rbxasset://textures/particles/smoke_main.dds",
 		},
 		hazards = {
 			{
